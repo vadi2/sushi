@@ -22,7 +22,9 @@ export class InstanceDefinition {
    * @returns {string} the filename
    */
   getFileName(): string {
-    return `${this.resourceType}-${this.id ?? this._instanceMeta.name}.json`;
+    return `${this.resourceType.split('/').slice(-1)[0]}-${
+      this.id ?? this._instanceMeta.name
+    }.json`;
   }
 
   toJSON(): any {

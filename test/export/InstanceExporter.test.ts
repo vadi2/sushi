@@ -10,9 +10,11 @@ import {
   Extension,
   FshCodeSystem,
   RuleSet,
-  FshQuantity
+  FshQuantity,
+  Logical
 } from '../../src/fshtypes';
 import {
+  AddElementRule,
   AssignmentRule,
   CardRule,
   CaretValueRule,
@@ -120,6 +122,30 @@ describe('InstanceExporter', () => {
     expect(exported.length).toBe(1); // One instance is successfully exported because profile is defined
     expect(exported[0]._instanceMeta.name).toBe('Bar');
     expect(exported[0].resourceType).toBe('Patient');
+  });
+
+  it('should export instances with InstanceOf Logical', () => {
+    const logicalFoo = new Logical('Foo');
+    logicalFoo.parent = 'Patient';
+    const addElementRule = new AddElementRule('boo');
+    addElementRule.min = 0;
+    addElementRule.max = '1';
+    addElementRule.types.push({ type: 'string' });
+    addElementRule.short = 'Nick was here';
+    logicalFoo.rules.push(addElementRule);
+    const instanceBar = new Instance('Bar');
+    instanceBar.instanceOf = 'Foo';
+    const assignmentRule = new AssignmentRule('boo');
+    assignmentRule.value = "Don't forget me";
+    instanceBar.rules.push(assignmentRule);
+    doc.profiles.set(logicalFoo.name, logicalFoo);
+    doc.instances.set(instanceBar.name, instanceBar);
+    sdExporter.export();
+    const exported = exporter.export().instances;
+    expect(exported.length).toBe(1); // One instance is successfully exported because logical is defined
+    expect(exported[0]._instanceMeta.name).toBe('Bar');
+    expect(exported[0].resourceType).toBe('http://hl7.org/fhir/us/minimal/StructureDefinition/Foo');
+    expect(exported[0].boo).toEqual("Don't forget me");
   });
 
   it('should assign values on an instance', () => {

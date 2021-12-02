@@ -279,7 +279,8 @@ export class InstanceExporter implements Fishable {
       Type.Resource,
       Type.Profile,
       Type.Extension,
-      Type.Type
+      Type.Type,
+      Type.Logical
     );
 
     if (!json) {
@@ -300,7 +301,7 @@ export class InstanceExporter implements Fishable {
       );
     }
 
-    if (json.kind !== 'resource') {
+    if (json.kind !== 'resource' && json.kind !== 'logical') {
       // If the instance is not a resource, it should be inline, since it cannot exist as a standalone instance
       isResource = false;
       if (fshDefinition.usage !== 'Inline') {
