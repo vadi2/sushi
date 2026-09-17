@@ -55,14 +55,15 @@ export function fshifyString(input: string): string {
 // Looking up a rule by path (e.g., a definition's id, url, name, or version) scans the rules on the
 // definition, and the FSHTank does this for every entity it checks on every fish. For definitions with many
 // rules (e.g., large code systems) that scan is expensive enough to dominate the build, so the rule found by
-// each lookup is cached against the definition's rules array. The cache is discarded when the array's length
-// or last rule changes, which covers how SUSHI changes rules arrays: they are appended to, inserted into, or
-// replaced wholesale (as applyInsertRules does). The rule rather than its value is cached, so a change to the
-// rule's value is still seen, and a cached rule is re-checked against the lookup in case its path was changed
-// in place so that it no longer matches (as CodeSystemExporter does to code caret rules).
-// Two changes are not detected: replacing or reordering rules without changing the array's length or last
-// rule, and changing a rule in place so that it newly matches a lookup. Code that does either must call
-// clearRuleLookupCache afterwards.
+// each lookup is cached against the definition's rules array. A definition whose rules array is replaced (as
+// applyInsertRules does) therefore starts with an empty cache. The cache is also discarded when the array's
+// length or last rule changes, which detects appending, inserting, and removing rules; SUSHI itself only
+// appends. The rule rather than its value is cached, so a change to the rule's value is still seen, and a
+// cached rule is re-checked against the lookup in case its path was changed in place so that it no longer
+// matches (as CodeSystemExporter does to code caret rules).
+// Two changes are not detected: replacing or reordering rules within the same array without changing its
+// length or last rule, and changing a rule in place so that it newly matches a lookup. Code that does either
+// must call clearRuleLookupCache afterwards.
 type RuleLookupCache = {
   length: number;
   lastRule: Rule;

@@ -1607,16 +1607,21 @@ describe('CodeSystemExporter', () => {
     // RuleSet: NameRules
     // * name ^designation[0].value = "Not for a concept"
     const codeSystem = new FshCodeSystem('CaretCodeSystem');
+    // neither the element path nor the element path without its first character (where a # would be) is a code
     const someCode = new ConceptRule('ame', 'Ame');
+    const otherCode = new ConceptRule('name', 'Name');
     const someCaret = new CaretValueRule('name');
     someCaret.pathArray = ['name'];
     someCaret.caretPath = 'designation[0].value';
     someCaret.value = 'Not for a concept';
-    codeSystem.rules.push(someCode, someCaret);
+    codeSystem.rules.push(someCode, otherCode, someCaret);
     doc.codeSystems.set(codeSystem.name, codeSystem);
     const exported = exporter.export().codeSystems;
     expect(exported.length).toBe(1);
-    expect(exported[0].concept).toEqual([{ code: 'ame', display: 'Ame' }]);
+    expect(exported[0].concept).toEqual([
+      { code: 'ame', display: 'Ame' },
+      { code: 'name', display: 'Name' }
+    ]);
     expect(loggerSpy.getAllMessages('error')).toHaveLength(1);
     expect(loggerSpy.getLastMessage('error')).toMatch(/does not exist: name/);
   });
@@ -1627,6 +1632,9 @@ describe('CodeSystemExporter', () => {
     // * ^url = "http://other.example.org/CodeSystem/moved"
     // RuleSet: ContextRules
     // * name insert UrlRules
+    // CodeSystem: CaretCodeSystem
+    // * insert ContextRules
+    // * #someCode
     const codeSystem = new FshCodeSystem('CaretCodeSystem');
     const urlRule = new CaretValueRule('name');
     urlRule.caretPath = 'url';

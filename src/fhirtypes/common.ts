@@ -98,7 +98,8 @@ export function splitOnPathPeriods(path: string): string[] {
  * @param {StructureDefinition} instanceSD - The instance's own StructureDefinition (as returned by its
  *   getOwnStructureDefinition), if the caller already has it. CodeSystem and ValueSet rebuild theirs from JSON
  *   on every call to getOwnStructureDefinition, so callers applying many rules to one such instance should
- *   pass it in. It is unfolded in place as paths are validated.
+ *   pass it in. It is modified in place (unfolded, and sliced for extensions and choices) as paths are
+ *   validated, so it should only be shared between calls on the same instance.
  */
 export function setPropertyOnDefinitionInstance(
   instance: StructureDefinition | ElementDefinition | CodeSystem | ValueSet,

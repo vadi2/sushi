@@ -154,8 +154,9 @@ export class CodeSystemExporter {
       }
     });
     resolveSoftIndexing(successfulRules);
-    // a rule whose path was just reset to an empty path may newly match a cached lookup (e.g., a ^url rule
-    // inserted with a path context), which the cache can not detect
+    // the paths of these rules were changed in place, and a rule whose path was reset to an empty path may
+    // newly match a cached lookup (e.g., a ^url rule inserted with a path context), which the cache can not
+    // detect. resolving soft indexes can not make a rule match a lookup, but clear the cache after both.
     clearRuleLookupCache(fshDefinition.rules);
 
     // a codesystem is a specific case where the only implied values are going to be extension urls.
