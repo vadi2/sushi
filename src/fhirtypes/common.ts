@@ -95,9 +95,10 @@ export function splitOnPathPeriods(path: string): string[] {
  * @param {any} value - The value to assign
  * @param {Fishable} fisher - A fishable implementation for finding definitions and metadata
  * @param {string[]} inlineResourceTypes - Types that will be used to replace Resource elements
- * @param {StructureDefinition} instanceSD - The instance's own StructureDefinition, if the caller already has it.
- *   CodeSystem and ValueSet rebuild theirs from JSON on every call to getOwnStructureDefinition, so callers
- *   applying many rules to one such instance should pass it in.
+ * @param {StructureDefinition} instanceSD - The instance's own StructureDefinition (as returned by its
+ *   getOwnStructureDefinition), if the caller already has it. CodeSystem and ValueSet rebuild theirs from JSON
+ *   on every call to getOwnStructureDefinition, so callers applying many rules to one such instance should
+ *   pass it in. It is unfolded in place as paths are validated.
  */
 export function setPropertyOnDefinitionInstance(
   instance: StructureDefinition | ElementDefinition | CodeSystem | ValueSet,
@@ -693,8 +694,8 @@ export function setPropertyOnInstance(
           }
         }
         if (index >= current[key].length) {
-          // Add only the missing elements: iterating from 0 on every call made filling a large array
-          // quadratic. Empty elements should be null, not undefined, according to
+          // Add only the missing elements, starting from the current length, so that filling a large array
+          // one index at a time stays linear. Empty elements should be null, not undefined, according to
           // https://www.hl7.org/fhir/json.html#primitive
           for (let j = current[key].length; j <= index; j++) {
             if (sliceName) {

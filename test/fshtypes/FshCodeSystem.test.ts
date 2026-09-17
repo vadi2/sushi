@@ -55,6 +55,23 @@ describe('FshCodeSystem', () => {
       expect(p.id).toBe('different-id');
     });
 
+    it('should return an id set by a caret rule inserted before the last rule', () => {
+      const p = new FshCodeSystem('MyCodeSystem');
+      const idRule = new CaretValueRule('');
+      idRule.caretPath = 'id';
+      idRule.value = 'first-id';
+      const titleRule = new CaretValueRule('');
+      titleRule.caretPath = 'title';
+      titleRule.value = 'My Code System';
+      p.rules.push(idRule, titleRule);
+      expect(p.id).toBe('first-id');
+      const insertedIdRule = new CaretValueRule('');
+      insertedIdRule.caretPath = 'id';
+      insertedIdRule.value = 'inserted-id';
+      p.rules.splice(1, 0, insertedIdRule);
+      expect(p.id).toBe('inserted-id');
+    });
+
     it('should return the last id set by caret rules as the rules change', () => {
       const p = new FshCodeSystem('MyCodeSystem');
       const idRule = new CaretValueRule('');
@@ -98,7 +115,8 @@ describe('FshCodeSystem', () => {
       conceptIdRule.caretPath = 'id';
       conceptIdRule.value = 'foo-element-id';
       p.rules.push(idRule, conceptIdRule);
-      // reading the id here caches the rule that was found
+      // until its path is resolved, the code caret rule is the last match, so reading the id here caches it
+      // (the assertion is loose so that it does not pin that quirk)
       expect(p.id).toBeDefined();
       conceptIdRule.path = 'concept[0]';
       expect(p.id).toBe('different-id');
