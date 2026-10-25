@@ -1,0 +1,84 @@
+import { FSHDocument, ImportCache, CachedImport } from '../import';
+import { captureLogs, emitLogInfo } from './logCapture';
+import { decode, encode, hashString } from './serialize';
+import { definitionRegistry } from './registries';
+import { PayloadStore } from './ExportSession';
+
+export type ParseState = Record<string, { hash: string; ref: string }>;
+
+/**
+ * The cache of imported FSH files. Each file's entry is found by its path and the hash of its
+ * content, and holds what importing it produced (see FSHImporter.importWithCache).
+ */
+export class ParseCache implements ImportCache {
+  readonly entries: ParseState = {};
+  /** The number of files whose cached import was reused */
+  hits = 0;
+  /** The number of files that were imported again */
+  get misses(): number {
+    return this.looked - this.hits;
+  }
+  private looked = 0;
+
+  constructor(
+    private readonly payloads: PayloadStore,
+    private readonly old: ParseState | null
+  ) {}
+
+  lookup(file: string, content: string): CachedImport | null {
+    this.looked++;
+    const old = this.old?.[file];
+    if (old == null || old.hash !== hashString(content)) {
+      return null;
+    }
+    try {
+      const entry = this.payloads.getPayload(old.ref);
+      if (
+        !Array.isArray(entry?.parseLogs) ||
+        !Array.isArray(entry.items) ||
+        !Array.isArray(entry.dependencies) ||
+        !Array.isArray(entry.visitLogs) ||
+        entry.doc == null
+      ) {
+        return null;
+      }
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
+  keep(file: string): void {
+    this.hits++;
+    this.entries[file] = this.old[file];
+  }
+
+  store(file: string, content: string, entry: CachedImport): void {
+    try {
+      const ref = this.payloads.putPayload(JSON.stringify(entry));
+      this.entries[file] = { hash: hashString(content), ref };
+    } catch {
+      // not cached; the file will just be imported again next time
+    }
+  }
+
+  capture<T>(fn: () => T, mute: boolean): { result: T; logs: any[] | null } {
+    return captureLogs(fn, mute);
+  }
+
+  emit(logs: any[]): void {
+    logs.forEach(emitLogInfo);
+  }
+
+  hash(value: any): string {
+    return hashString(JSON.stringify(encode(value, definitionRegistry())));
+  }
+
+  encodeDoc(doc: FSHDocument): any {
+    return encode(doc, definitionRegistry());
+  }
+
+  decodeDoc(encoded: any): FSHDocument {
+    return decode(encoded, definitionRegistry());
+  }
+}

@@ -145,8 +145,111 @@ function unescapeUnicode(match: string, p1: string): string {
  * each `ctx` has cannot be used because their signatures return `void` by default. Instead,
  * we must call the explicit visitX functions.
  */
+type PreprocessedAlias = { alias: string; value: string; location: TextLocation };
+type PreprocessedRuleSet = {
+  ruleSet: string;
+  params: string[];
+  contents: string;
+  location: TextLocation;
+};
+export type PreprocessedItem = PreprocessedAlias | PreprocessedRuleSet;
+
+type DocumentCollection =
+  | 'profiles'
+  | 'extensions'
+  | 'resources'
+  | 'logicals'
+  | 'instances'
+  | 'valueSets'
+  | 'codeSystems'
+  | 'invariants'
+  | 'ruleSets'
+  | 'mappings';
+
+/**
+ * Something a document's import used that comes from outside the document itself: whether an
+ * alias exists and what it is, a parameterized RuleSet (by hash), or whether an entity with the
+ * same name was already imported from another document.
+ */
+export type ImportDependency =
+  | ['aliasHas', string, boolean]
+  | ['aliasGet', string, string | null]
+  | ['ruleSet', string, string]
+  | ['duplicate', DocumentCollection, string, boolean];
+
+/** What importing one file produced, for reuse by a later incremental build. */
+export interface CachedImport {
+  parseLogs: any[];
+  items: PreprocessedItem[];
+  dependencies: ImportDependency[];
+  visitLogs: any[];
+  doc: any;
+}
+
+/**
+ * Lets FSHImporter reuse the results of importing unchanged files. Logs are captured as copies,
+ * so they can be written again exactly as they were.
+ */
+export interface ImportCache {
+  lookup(file: string, content: string): CachedImport | null;
+  keep(file: string): void;
+  store(file: string, content: string, entry: CachedImport): void;
+  capture<T>(fn: () => T, mute: boolean): { result: T; logs: any[] | null };
+  emit(logs: any[]): void;
+  hash(value: any): string;
+  encodeDoc(doc: FSHDocument): any;
+  decodeDoc(encoded: any): FSHDocument;
+}
+
+class DependencyRecorder {
+  readonly list: ImportDependency[] = [];
+  private readonly seen = new Set<string>();
+  failed = false;
+
+  constructor(private readonly hash: (value: any) => string) {}
+
+  note(dependency: ImportDependency) {
+    const key = JSON.stringify(dependency.slice(0, -1));
+    if (!this.seen.has(key)) {
+      this.seen.add(key);
+      this.list.push(dependency);
+    }
+  }
+
+  noteRuleSet(name: string, ruleSet: ParamRuleSet) {
+    const key = JSON.stringify(['ruleSet', name]);
+    if (!this.seen.has(key)) {
+      try {
+        this.note(['ruleSet', name, this.hash(ruleSet ?? null)]);
+      } catch {
+        this.failed = true;
+      }
+    }
+  }
+}
+
+/** A Map that reports reads of it, so the importer can tell what a document depended on. */
+class ObservedMap<V> extends Map<string, V> {
+  onHas: (key: string, result: boolean) => void = null;
+  onGet: (key: string, result: V) => void = null;
+
+  has(key: string): boolean {
+    const result = super.has(key);
+    this.onHas?.(key, result);
+    return result;
+  }
+
+  get(key: string): V {
+    const result = super.get(key);
+    this.onGet?.(key, result);
+    return result;
+  }
+}
+
 export class FSHImporter extends FSHVisitor {
   private docs: FSHDocument[] = [];
+  private dependencies: DependencyRecorder = null;
+  private visitingDoc: FSHDocument = null;
   private currentFile: string;
   private currentDoc: FSHDocument;
   private allAliases: Map<string, string>;
@@ -160,7 +263,10 @@ export class FSHImporter extends FSHVisitor {
     this.topLevelParse = true;
   }
 
-  import(rawFSHes: RawFSH[]): FSHDocument[] {
+  import(rawFSHes: RawFSH[], cache?: ImportCache): FSHDocument[] {
+    if (cache != null) {
+      return this.importWithCache(rawFSHes, cache);
+    }
     this.allAliases = new Map();
     const contexts: pc.DocContext[] = [];
 
@@ -183,44 +289,7 @@ export class FSHImporter extends FSHVisitor {
       contexts.push(ctx);
 
       // Collect the aliases and store in global map
-      ctx.entity().forEach(e => {
-        if (e.alias()) {
-          const name = e.alias().name().getText();
-          let value = e.alias().SEQUENCE()?.getText();
-          // When the url contains a fragment (http://example.org#fragment), the grammar will read it as a
-          // CODE, so we also accept that for the value here
-          if (!value && e.alias().CODE()) {
-            value = e.alias().CODE().getText();
-          }
-          if (name.includes('|')) {
-            logger.error(
-              `Alias ${name} cannot include "|" since the "|" character is reserved for indicating a version`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-            return;
-          } else if (!aliasRegex.test(name)) {
-            logger.warn(
-              `Alias ${name} includes unsupported characters. Alias names can only contain letters, numbers, underscores ("_"), hyphens ("-"), and dots (".").`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-          }
-          if (this.allAliases.has(name) && this.allAliases.get(name) !== value) {
-            logger.error(
-              `Alias ${name} cannot be redefined to ${value}; it is already defined as ${this.allAliases.get(
-                name
-              )}.`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-            // don't set it -- just keep the original definition
-          } else {
-            this.allAliases.set(name, value);
-            doc.aliases.set(name, value);
-          }
-        }
-        if (e.paramRuleSet()) {
-          this.visitParamRuleSet(e.paramRuleSet());
-        }
-      });
+      this.applyPreprocessedItems(doc, this.extractPreprocessedItems(ctx));
       this.currentDoc = null;
       this.currentFile = null;
     });
@@ -249,6 +318,244 @@ export class FSHImporter extends FSHVisitor {
     logger.info(`Imported ${definitions} definitions and ${instances} instances.`);
 
     return this.docs;
+  }
+
+  /**
+   * Imports like import, but reuses what was imported from each unchanged file, as long as
+   * everything that file's import used from other files is also unchanged. The documents and the
+   * log messages are the same as import's.
+   */
+  private importWithCache(rawFSHes: RawFSH[], cache: ImportCache): FSHDocument[] {
+    const aliases = new ObservedMap<string>();
+    const paramRuleSets = new ObservedMap<ParamRuleSet>();
+    this.allAliases = aliases;
+    this.paramRuleSets = paramRuleSets;
+    aliases.onHas = (key, result) => this.dependencies?.note(['aliasHas', key, result]);
+    aliases.onGet = (key, result) => this.dependencies?.note(['aliasGet', key, result ?? null]);
+    paramRuleSets.onGet = (key, result) => this.dependencies?.noteRuleSet(key, result);
+    const files: {
+      rawFSH: RawFSH;
+      content: string;
+      cached: CachedImport | null;
+      ctx: pc.DocContext | null;
+      parseLogs: any[] | null;
+      items: PreprocessedItem[];
+    }[] = [];
+
+    rawFSHes.forEach(rawFSH => {
+      const doc = new FSHDocument(rawFSH.path);
+      this.docs.push(doc);
+      this.currentDoc = doc;
+      this.currentFile = this.currentDoc.file ?? '';
+      // See import for why the newline is added
+      const content = rawFSH.content.endsWith('\n') ? rawFSH.content : rawFSH.content + '\n';
+      const cached = cache.lookup(rawFSH.path, content);
+      let ctx: pc.DocContext = null;
+      let parseLogs: any[] = null;
+      let items: PreprocessedItem[];
+      if (cached != null) {
+        cache.emit(cached.parseLogs);
+        parseLogs = cached.parseLogs;
+        items = cached.items;
+      } else {
+        const parsed = cache.capture(() => this.parseDoc(content, rawFSH.path), false);
+        ctx = parsed.result;
+        parseLogs = parsed.logs;
+        items = this.extractPreprocessedItems(ctx);
+      }
+      this.applyPreprocessedItems(doc, items);
+      files.push({ rawFSH, content, cached, ctx, parseLogs, items });
+      this.currentDoc = null;
+      this.currentFile = null;
+    });
+    logger.info(`Preprocessed ${this.docs.length} documents with ${this.allAliases.size} aliases.`);
+
+    files.forEach((file, index) => {
+      const liveDoc = this.docs[index];
+      if (file.cached != null && this.dependenciesHold(file.cached.dependencies, liveDoc, cache)) {
+        let doc: FSHDocument = null;
+        try {
+          doc = cache.decodeDoc(file.cached.doc);
+        } catch {
+          doc = null;
+        }
+        if (doc instanceof FSHDocument && doc.file === liveDoc.file) {
+          // aliases are collected during preprocessing, which already ran for this build
+          doc.aliases.clear();
+          liveDoc.aliases.forEach((value, name) => doc.aliases.set(name, value));
+          this.docs[index] = doc;
+          cache.emit(file.cached.visitLogs);
+          cache.keep(file.rawFSH.path);
+          return;
+        }
+      }
+      let ctx = file.ctx;
+      if (ctx == null) {
+        // its parse messages were already written, during preprocessing
+        ctx = cache.capture(() => this.parseDoc(file.content, file.rawFSH.path), true).result;
+      }
+      this.currentDoc = liveDoc;
+      this.currentFile = this.currentDoc.file ?? '';
+      this.visitingDoc = liveDoc;
+      const dependencies = new DependencyRecorder(value => cache.hash(value));
+      this.dependencies = dependencies;
+      let visited: { logs: any[] | null };
+      try {
+        visited = cache.capture(() => this.visitDoc(ctx), false);
+      } finally {
+        this.dependencies = null;
+        this.visitingDoc = null;
+        this.currentDoc = null;
+        this.currentFile = null;
+      }
+      if (file.parseLogs != null && visited.logs != null && !dependencies.failed) {
+        let encoded: any = null;
+        try {
+          encoded = cache.encodeDoc(liveDoc);
+        } catch {
+          encoded = null;
+        }
+        if (encoded != null) {
+          cache.store(file.rawFSH.path, file.content, {
+            parseLogs: file.parseLogs,
+            items: file.items,
+            dependencies: dependencies.list,
+            visitLogs: visited.logs,
+            doc: encoded
+          });
+        }
+      }
+    });
+
+    let [definitions, instances] = [0, 0];
+    this.docs.forEach(doc => {
+      definitions +=
+        doc.codeSystems.size +
+        doc.extensions.size +
+        doc.profiles.size +
+        doc.valueSets.size +
+        doc.logicals.size +
+        doc.resources.size;
+      instances += doc.instances.size;
+    });
+    logger.info(`Imported ${definitions} definitions and ${instances} instances.`);
+
+    return this.docs;
+  }
+
+  /** Whether everything a document's import used from outside it is the same as it was then. */
+  private dependenciesHold(
+    dependencies: ImportDependency[],
+    doc: FSHDocument,
+    cache: ImportCache
+  ): boolean {
+    try {
+      return dependencies.every(dependency => {
+        switch (dependency[0]) {
+          case 'aliasHas':
+            return Map.prototype.has.call(this.allAliases, dependency[1]) === dependency[2];
+          case 'aliasGet':
+            return (
+              (Map.prototype.get.call(this.allAliases, dependency[1]) ?? null) === dependency[2]
+            );
+          case 'ruleSet':
+            return (
+              cache.hash(Map.prototype.get.call(this.paramRuleSets, dependency[1]) ?? null) ===
+              dependency[2]
+            );
+          case 'duplicate':
+            return (
+              this.docs.some(
+                d => d !== doc && (d[dependency[1]] as Map<string, any>)?.has(dependency[2])
+              ) === dependency[3]
+            );
+          default:
+            return false;
+        }
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Finds the aliases and parameterized RuleSets in a parsed document. These are collected from
+   * every document before any document is visited, since any document may use them.
+   */
+  private extractPreprocessedItems(ctx: pc.DocContext): PreprocessedItem[] {
+    const items: PreprocessedItem[] = [];
+    ctx.entity().forEach(e => {
+      if (e.alias()) {
+        const name = e.alias().name().getText();
+        let value = e.alias().SEQUENCE()?.getText();
+        // When the url contains a fragment (http://example.org#fragment), the grammar will read it as a
+        // CODE, so we also accept that for the value here
+        if (!value && e.alias().CODE()) {
+          value = e.alias().CODE().getText();
+        }
+        items.push({ alias: name, value, location: this.extractStartStop(e.alias()) });
+      }
+      if (e.paramRuleSet()) {
+        const ctx = e.paramRuleSet();
+        const { name, params } = this.parseRuleSetReference(ctx.paramRuleSetRef());
+        items.push({
+          ruleSet: name,
+          params,
+          contents: this.visitParamRuleSetContent(ctx.paramRuleSetContent()),
+          location: this.extractStartStop(ctx)
+        });
+      }
+    });
+    return items;
+  }
+
+  private applyPreprocessedItems(doc: FSHDocument, items: PreprocessedItem[]): void {
+    items.forEach(item => {
+      if ('alias' in item) {
+        this.applyAlias(doc, item);
+      } else {
+        this.applyParamRuleSet(item);
+      }
+    });
+  }
+
+  private applyAlias(doc: FSHDocument, item: PreprocessedAlias): void {
+    const name = item.alias;
+    const value = item.value;
+    if (name.includes('|')) {
+      logger.error(
+        `Alias ${name} cannot include "|" since the "|" character is reserved for indicating a version`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+      return;
+    } else if (!aliasRegex.test(name)) {
+      logger.warn(
+        `Alias ${name} includes unsupported characters. Alias names can only contain letters, numbers, underscores ("_"), hyphens ("-"), and dots (".").`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+    }
+    if (this.allAliases.has(name) && this.allAliases.get(name) !== value) {
+      logger.error(
+        `Alias ${name} cannot be redefined to ${value}; it is already defined as ${this.allAliases.get(
+          name
+        )}.`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+      // don't set it -- just keep the original definition
+    } else {
+      this.allAliases.set(name, value);
+      doc.aliases.set(name, value);
+    }
+  }
+
+  private isDuplicate(collection: DocumentCollection, name: string): boolean {
+    if (this.dependencies != null) {
+      const elsewhere = this.docs.some(
+        doc => doc !== this.visitingDoc && (doc[collection] as Map<string, any>).has(name)
+      );
+      this.dependencies.note(['duplicate', collection, name, elsewhere]);
+    }
+    return this.docs.some(doc => (doc[collection] as Map<string, any>).has(name));
   }
 
   visitDoc(ctx: pc.DocContext): void {
@@ -296,7 +603,7 @@ export class FSHImporter extends FSHVisitor {
     const profile = new Profile(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.profiles.has(profile.name))) {
+    if (this.isDuplicate('profiles', profile.name)) {
       logger.error(`Skipping Profile: a Profile named ${profile.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -311,7 +618,7 @@ export class FSHImporter extends FSHVisitor {
     const extension = new Extension(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.extensions.has(extension.name))) {
+    if (this.isDuplicate('extensions', extension.name)) {
       logger.error(`Skipping Extension: an Extension named ${extension.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -370,7 +677,7 @@ export class FSHImporter extends FSHVisitor {
     const resource = new Resource(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.resources.has(resource.name))) {
+    if (this.isDuplicate('resources', resource.name)) {
       logger.error(`Skipping Resource: a Resource named ${resource.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -385,7 +692,7 @@ export class FSHImporter extends FSHVisitor {
     const logical = new Logical(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.logicals.has(logical.name))) {
+    if (this.isDuplicate('logicals', logical.name)) {
       logger.error(
         `Skipping Logical Model: a Logical Model named ${logical.name} already exists.`,
         {
@@ -448,7 +755,7 @@ export class FSHImporter extends FSHVisitor {
     const instance = new Instance(ctx.name().getText())
       .withLocation(location)
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.instances.has(instance.name))) {
+    if (this.isDuplicate('instances', instance.name)) {
       logger.error(`Skipping Instance: an Instance named ${instance.name} already exists.`, {
         file: this.currentFile,
         location
@@ -526,7 +833,7 @@ export class FSHImporter extends FSHVisitor {
     const valueSet = new FshValueSet(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.valueSets.has(valueSet.name))) {
+    if (this.isDuplicate('valueSets', valueSet.name)) {
       logger.error(`Skipping ValueSet: a ValueSet named ${valueSet.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -595,7 +902,7 @@ export class FSHImporter extends FSHVisitor {
     const codeSystem = new FshCodeSystem(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.codeSystems.has(codeSystem.name))) {
+    if (this.isDuplicate('codeSystems', codeSystem.name)) {
       logger.error(`Skipping code system: a code system named ${codeSystem.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -646,7 +953,7 @@ export class FSHImporter extends FSHVisitor {
     const invariant = new Invariant(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.invariants.has(invariant.name))) {
+    if (this.isDuplicate('invariants', invariant.name)) {
       logger.error(`Skipping Invariant: an Invariant named ${invariant.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -701,7 +1008,7 @@ export class FSHImporter extends FSHVisitor {
     const ruleSet = new RuleSet(ctx.RULESET_REFERENCE().getText().trim())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.ruleSets.has(ruleSet.name))) {
+    if (this.isDuplicate('ruleSets', ruleSet.name)) {
       logger.error(`Skipping RuleSet: a RuleSet named ${ruleSet.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -734,17 +1041,26 @@ export class FSHImporter extends FSHVisitor {
 
   visitParamRuleSet(ctx: pc.ParamRuleSetContext): void {
     const { name, params } = this.parseRuleSetReference(ctx.paramRuleSetRef());
-    const paramRuleSet = new ParamRuleSet(name)
-      .withLocation(this.extractStartStop(ctx))
+    this.applyParamRuleSet({
+      ruleSet: name,
+      params,
+      contents: this.visitParamRuleSetContent(ctx.paramRuleSetContent()),
+      location: this.extractStartStop(ctx)
+    });
+  }
+
+  private applyParamRuleSet(item: PreprocessedRuleSet): void {
+    const paramRuleSet = new ParamRuleSet(item.ruleSet)
+      .withLocation({ ...item.location })
       .withFile(this.currentFile);
     if (this.paramRuleSets.has(paramRuleSet.name)) {
       logger.error(`Skipping RuleSet: a RuleSet named ${paramRuleSet.name} already exists.`, {
         file: this.currentFile,
-        location: this.extractStartStop(ctx)
+        location: { ...item.location }
       });
     } else {
-      paramRuleSet.parameters = params;
-      paramRuleSet.contents = this.visitParamRuleSetContent(ctx.paramRuleSetContent());
+      paramRuleSet.parameters = item.params;
+      paramRuleSet.contents = item.contents;
       const unusedParameters = paramRuleSet.getUnusedParameters();
       if (unusedParameters.length > 0) {
         logger.warn(
@@ -766,7 +1082,7 @@ export class FSHImporter extends FSHVisitor {
     const mapping = new Mapping(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.mappings.has(mapping.name))) {
+    if (this.isDuplicate('mappings', mapping.name)) {
       logger.error(`Skipping Mapping: a Mapping named ${mapping.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
