@@ -75,6 +75,8 @@ export interface ExportState {
 export interface PayloadStore {
   putPayload(json: string): string;
   getPayload(ref: string): any;
+  /** Notes that a cached result could not be used */
+  readFailed?(e: any): void;
 }
 
 export interface ExportStats {
@@ -229,6 +231,8 @@ export class ExportSession implements IncrementalSessionHooks {
   readonly notes: string[] = [];
   readonly errors: string[] = [];
   private untracked = 0;
+  /** Whether any record of the previous build was looked at */
+  consultedOld = false;
 
   constructor(
     private readonly store: PayloadStore,
@@ -242,6 +246,11 @@ export class ExportSession implements IncrementalSessionHooks {
         'exports were not reused, as a definition changed unexpectedly during the previous build'
       );
     }
+  }
+
+  /** Whether anything may be replayed, so the export may have to be redone */
+  get mayReplay(): boolean {
+    return this.canAbort && this.replayEnabled;
   }
 
   get stats(): ExportStats {
@@ -286,6 +295,9 @@ export class ExportSession implements IncrementalSessionHooks {
       }
     } catch (e) {
       // Nothing has been exported yet, so just export everything and keep no record of it
+      if (this.replayEnabled) {
+        this.notes.push('exports were not reused, as the export could not be prepared');
+      }
       this.replayEnabled = false;
       this.saveable = false;
       this.abortReason = `could not prepare the export (${e?.message})`;
@@ -347,6 +359,9 @@ export class ExportSession implements IncrementalSessionHooks {
   private pinSdCacheEntries() {
     const mayExport = new Set<string>();
     const pinFrom = (key: string, def: any) => {
+      if (this.oldRecords.has(key)) {
+        this.consultedOld = true;
+      }
       for (const ev of this.oldRecords.get(key)?.script ?? []) {
         if (ev[0] === 'S') {
           this.pinnedUrls.add(ev[1]);
@@ -417,6 +432,9 @@ export class ExportSession implements IncrementalSessionHooks {
   private staticallyReusable(key: string): boolean {
     const old = this.oldRecords.get(key);
     const pre = this.preHash.get(key);
+    if (old != null) {
+      this.consultedOld = true;
+    }
     if (old == null || !old.ok || old.kind !== this.kindOfKey.get(key) || pre == null) {
       return false;
     }
@@ -1392,6 +1410,7 @@ export class ExportSession implements IncrementalSessionHooks {
     if (old == null) {
       return this.reason('new');
     }
+    this.consultedOld = true;
     if (!old.ok) {
       return this.reason(`not reusable: ${old.why}`);
     }
@@ -1503,7 +1522,9 @@ export class ExportSession implements IncrementalSessionHooks {
         } else {
           standIn = decode(payload.obj, this.pkgRegistry);
         }
-      } catch {
+      } catch (e) {
+        this.keepError(`reading the cached result of ${key}`, e);
+        this.store.readFailed?.(e);
         return this.reason('cache read failed');
       }
     } else if (old.script.some(ev => ev[0] === 'P')) {
@@ -1647,6 +1668,7 @@ export class ExportSession implements IncrementalSessionHooks {
         replaceOwnProperties(def, decode(this.store.getPayload(old.afterRef), this.defRegistry));
       } catch (e) {
         this.keepError(`restoring ${key}`, e);
+        this.store.readFailed?.(e);
         this.abort(`could not restore ${key}: ${e?.message}`);
         return undefined;
       }
@@ -1675,7 +1697,7 @@ export class ExportSession implements IncrementalSessionHooks {
   }
 
   private abort(why: string) {
-    if (!this.canAbort) {
+    if (!this.mayReplay) {
       // Nothing was replayed or can be, so the export is exactly what it would be without a
       // session. It just cannot be trusted as a record for the next build.
       this.saveable = false;

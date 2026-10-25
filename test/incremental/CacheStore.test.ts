@@ -130,4 +130,31 @@ describe('CacheStore', () => {
     expect(fs.existsSync(file)).toBe(false);
     expect(store.corruptPayloads).toBe(1);
   });
+
+  it('should write a payload again when it went missing during the build', () => {
+    const ref = store.putPayload('{"a":1}');
+    const file = path.join(dir, 'p', `${ref}.json.gz`);
+    fs.unlinkSync(file);
+    expect(store.putPayload('{"a":1}')).toBe(ref);
+    expect(fs.existsSync(file)).toBe(true);
+    fs.unlinkSync(file);
+    expect(() => store.getPayload(ref)).toThrow();
+    expect(store.putPayload('{"a":1}')).toBe(ref);
+    expect(store.getPayload(ref)).toEqual({ a: 1 });
+  });
+
+  it('should note unexpected failures to clean up', () => {
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    // a file that is already gone is not a failure
+    const gone = store.putPayload('"gone"');
+    fs.unlinkSync(path.join(dir, 'p', `${gone}.json.gz`));
+    store.collectGarbage(new Set());
+    expect(store.cleanupError).toBeNull();
+    // but one that cannot be removed is
+    const stuck = path.join(dir, 'p', 'stuck.json.gz');
+    fs.mkdirSync(stuck);
+    fs.utimesSync(stuck, old, old);
+    store.collectGarbage(new Set());
+    expect(store.cleanupError).not.toBeNull();
+  });
 });

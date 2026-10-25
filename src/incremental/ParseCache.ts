@@ -40,12 +40,22 @@ export class ParseCache implements ImportCache {
         !Array.isArray(entry.visitLogs) ||
         entry.doc == null
       ) {
+        this.failed(`reading the cached import of ${file}`, new Error('unexpected content'));
         return null;
       }
       return entry;
-    } catch {
+    } catch (e) {
+      this.failed(`reading the cached import of ${file}`, e);
       return null;
     }
+  }
+
+  /** Unexpected errors, with their stacks, for debugging */
+  readonly errors: string[] = [];
+
+  private failed(during: string, e: any) {
+    this.errors.push(`while ${during}: ${e?.stack ?? e}`);
+    this.payloads.readFailed?.(e);
   }
 
   keep(file: string): void {
@@ -79,6 +89,12 @@ export class ParseCache implements ImportCache {
   }
 
   decodeDoc(encoded: any): FSHDocument {
-    return decode(encoded, definitionRegistry());
+    try {
+      return decode(encoded, definitionRegistry());
+    } catch (e) {
+      // the file is imported again
+      this.failed('decoding a cached import', e);
+      throw e;
+    }
   }
 }

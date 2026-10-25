@@ -169,7 +169,7 @@ describe('IncrementalBuild', () => {
       }
     );
 
-    it.each(['fishSignature', 'payloadOf', 'checkAfterExport'])(
+    it.each(['payloadOf', 'checkAfterExport'])(
       'should build normally with a cache when %s fails, and not use that cache again',
       method => {
         const expected = plainBuild();
@@ -193,6 +193,82 @@ describe('IncrementalBuild', () => {
         );
       }
     );
+
+    it('should keep the previous cache when preparing the export fails before using it', () => {
+      const expected = plainBuild();
+      incrementalBuild();
+      failIn('fishSignature');
+      const second = incrementalBuild();
+      expect({ out: second.out, messages: second.messages }).toEqual(expected);
+      expect(second.summary).toBe('Incremental build: reused 4 of 4 files, 0 of 4 exports.');
+      expect(second.notes[0]).toBe(
+        'Incremental build: exports were not reused, as the export could not be prepared.'
+      );
+      spy.mockRestore();
+      spy = null;
+      expect(incrementalBuild().summary).toBe(
+        'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
+      );
+    });
+
+    it('should keep the previous cache when two definitions have the same name', () => {
+      incrementalBuild();
+      const second = incrementalBuild(FSH, {}, tank => {
+        const all = tank.getAllValueSets.bind(tank);
+        tank.getAllValueSets = () => [...all(), ...all()];
+      });
+      expect(second.notes[0]).toBe(
+        'Incremental build: exports were not reused, as there are two definitions of FshValueSet:MyVS.'
+      );
+      expect(incrementalBuild().summary).toBe(
+        'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
+      );
+    });
+
+    it('should report what happened when exporting everything again fails', () => {
+      const expected = plainBuild();
+      incrementalBuild();
+      failIn('checkAfterExport');
+      let original: FSHTank = null;
+      const all = FSHTank.prototype.getAllInstances;
+      const tankSpy = jest.spyOn(FSHTank.prototype, 'getAllInstances').mockImplementation(function (
+        this: FSHTank
+      ) {
+        if (original != null && this !== original) {
+          throw new Error('kaboom');
+        }
+        return all.call(this);
+      });
+      try {
+        loggerSpy.reset();
+        const build = new IncrementalBuild(projectDir, '9.9.9');
+        original = build.importFSH(rawFSH(FSH), minimalConfig);
+        expect(() => build.exportFHIR(original, defs, {}, minimalConfig)).toThrow('kaboom');
+      } finally {
+        tankSpy.mockRestore();
+      }
+      const own = loggerSpy.getAllMessages('info').filter(m => m.startsWith('Incremental build:'));
+      expect(own[0]).toMatch(
+        /cached results did not apply; exported everything\), before the export failed\.$/
+      );
+      expect(own).toContainEqual(
+        expect.stringMatching(/exported everything again, because .*boom/)
+      );
+      expect(own).toContainEqual(expect.stringMatching(/exports cannot be reused \(.*kaboom/));
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .some(m => /unexpected error export: Error: kaboom/.test(m))
+      ).toBe(true);
+      // the records it used are not used again
+      spy.mockRestore();
+      spy = null;
+      const third = incrementalBuild();
+      expect({ out: third.out, messages: third.messages }).toEqual(expected);
+      expect(third.notes).toContain(
+        'Incremental build: exports were not reused, as the previous build could not save them.'
+      );
+    });
 
     it('should keep the previous cache when it was not used', () => {
       incrementalBuild();
@@ -280,6 +356,30 @@ describe('IncrementalBuild', () => {
     const second = incrementalBuild();
     expect({ out: second.out, messages: second.messages }).toEqual(expected);
     expect(second.summary).toBe('Incremental build: reused 0 of 4 files, 0 of 4 exports.');
+    expect(second.notes).toContainEqual(
+      expect.stringMatching(
+        /^Incremental build: could not use \d+ cached result\(s\) \(first: ENOENT/
+      )
+    );
+  });
+
+  it('should reuse imports when the build cannot be identified', () => {
+    incrementalBuild();
+    const config = path.join(projectDir, 'sushi-config.yaml');
+    fs.unlinkSync(config);
+    fs.mkdirSync(config);
+    const expected = plainBuild();
+    const second = incrementalBuild();
+    expect({ out: second.out, messages: second.messages }).toEqual(expected);
+    expect(second.summary).toMatch(
+      /^Incremental build: reused 4 of 4 files, but no exports, as the build could not be identified \(.*EISDIR/
+    );
+    fs.rmdirSync(config);
+    fs.writeFileSync(config, 'id: test\n');
+    // the exports recorded before are still there
+    expect(incrementalBuild().summary).toBe(
+      'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
+    );
   });
 
   it('should keep the cache out of git', () => {

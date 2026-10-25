@@ -35,6 +35,11 @@ export class CacheStore implements PayloadStore {
   writeError: string = null;
   /** How many payloads were found corrupt (and removed) */
   corruptPayloads = 0;
+  /** How many cached results could not be used, and the first reason */
+  readFailures = 0;
+  readError: string = null;
+  /** The first unexpected failure to clean up the cache, if any */
+  cleanupError: string = null;
 
   constructor(readonly dir: string) {
     this.payloadDir = path.join(dir, 'p');
@@ -79,9 +84,8 @@ export class CacheStore implements PayloadStore {
 
   putPayload(json: string): string {
     const ref = hashString(json);
-    if (this.known.has(ref)) {
-      this.touch(ref);
-    } else {
+    // A payload that went missing since the build started is written again
+    if (!this.known.has(ref) || !this.touch(ref)) {
       try {
         this.writeGz(path.join(this.payloadDir, `${ref}.json.gz`), json);
       } catch (e) {
@@ -100,7 +104,14 @@ export class CacheStore implements PayloadStore {
     const file = path.join(this.payloadDir, `${ref}.json.gz`);
     // Failing to read the file (it is missing, or the system refused) says nothing about its
     // content, but content that does not unzip, match its hash or parse is corrupt
-    const data = fs.readFileSync(file);
+    let data: Buffer;
+    try {
+      data = fs.readFileSync(file);
+    } catch (e) {
+      // So it is written again if this build produces it
+      this.known.delete(ref);
+      throw e;
+    }
     try {
       const json = zlib.gunzipSync(data).toString('utf8');
       if (hashString(json) !== ref) {
@@ -122,14 +133,28 @@ export class CacheStore implements PayloadStore {
     }
   }
 
-  /** Marks a payload as in use, so a concurrent build does not collect it. */
-  private touch(ref: string) {
+  /** Notes that a cached result could not be used (whether reading or decoding it failed). */
+  readFailed(e: any) {
+    this.readFailures++;
+    this.readError = this.readError ?? e?.message ?? String(e);
+  }
+
+  /**
+   * Marks a payload as in use, so a concurrent build does not collect it. Returns false if it is
+   * missing.
+   */
+  private touch(ref: string): boolean {
     try {
       const now = new Date();
       fs.utimesSync(path.join(this.payloadDir, `${ref}.json.gz`), now, now);
-    } catch {
-      // it is only a hint
+    } catch (e) {
+      if (e?.code === 'ENOENT') {
+        this.known.delete(ref);
+        return false;
+      }
+      // otherwise it is only a hint
     }
+    return true;
   }
 
   writeManifest(manifest: Manifest) {
@@ -162,8 +187,11 @@ export class CacheStore implements PayloadStore {
         }
         fs.unlinkSync(full);
         this.known.delete(ref);
-      } catch {
+      } catch (e) {
         // another build may have removed it already
+        if (e?.code !== 'ENOENT') {
+          this.cleanupError = this.cleanupError ?? e?.message ?? String(e);
+        }
       }
     }
   }

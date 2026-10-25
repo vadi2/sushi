@@ -64,12 +64,25 @@ export class IncrementalBuild {
       try {
         this.key = exportKey(this.tool, options, config, this.readConfigText(), defs);
       } catch (e) {
-        this.disabled = `could not identify the build (${e.message})`;
+        this.exportSkipped = e.message;
       }
     }
-    if (this.disabled != null) {
+    if (this.disabled != null || this.exportSkipped != null) {
       return exportFHIR(tank, defs);
     }
+    try {
+      return this.exportWithSessions(tank, defs);
+    } catch (e) {
+      // The export fails as it would without the cache, but still say what happened, and do not
+      // leave records that may be what made it fail
+      this.failed = true;
+      this.logSummary();
+      this.finish();
+      throw e;
+    }
+  }
+
+  private exportWithSessions(tank: FSHTank, defs: FHIRDefinitions): Package {
     let old: ExportState = null;
     if (this.manifest != null && this.manifest.globalKey !== this.key) {
       this.note(
@@ -80,22 +93,20 @@ export class IncrementalBuild {
     } else if (this.manifest != null) {
       old = this.manifest.export;
     }
-    let copy: any[] = null;
+    let snapshot: string = null;
     if (old != null) {
       // Replaying can be abandoned partway through, and the export changes the definitions in the
-      // tank, so keep a copy of them to start over from. Make sure now that the copy can be made,
-      // as nothing can be done about it later.
+      // tank, so keep a copy of them to start over from
       try {
-        const reg = definitionRegistry();
-        copy = decode(JSON.parse(JSON.stringify(encode(tank.docs, reg))), reg);
+        snapshot = JSON.stringify(encode(tank.docs, definitionRegistry()));
       } catch (e) {
         old = null;
         this.note(`exports were not reused, as the definitions could not be copied (${e.message})`);
       }
     }
-    this.usedPrevious = old != null;
     const first = new ExportSession(this.store, old);
     this.first = first;
+    this.session = first;
     // If the export is redone, nothing the first attempt logged may be kept, including what is
     // logged before the session starts (such as errors from applying insert rules)
     const held = old != null ? holdLogs() : null;
@@ -105,14 +116,27 @@ export class IncrementalBuild {
     } catch (e) {
       held?.release(true);
       throw e;
+    } finally {
+      this.usedPrevious = first.consultedOld;
     }
     if (pkg != null && !first.aborted) {
       held?.release(true);
-      this.session = first;
       return pkg;
     }
+    const why = first.abortReason ?? 'of an unknown problem';
+    let copy: any[];
+    try {
+      const reg = definitionRegistry();
+      copy = decode(JSON.parse(snapshot), reg);
+    } catch (e) {
+      // Nothing can be done without the copy, so keep what the first attempt logged, to explain
+      first.errors.push(`while copying the definitions: ${e?.stack ?? e}`);
+      held?.release(true);
+      this.note(`could not export everything again (${e.message}), after ${why}`);
+      throw e;
+    }
     held?.release(false);
-    this.note(`exported everything again, because ${first.abortReason ?? 'of an unknown problem'}`);
+    this.note(`exported everything again, because ${why}`);
     // Start over from the original definitions, and export everything without replaying
     this.redone = true;
     const fresh = new FSHTank(copy, tank.config);
@@ -126,6 +150,9 @@ export class IncrementalBuild {
   private first: ExportSession = null;
   // Whether the previous build's records were used (so they are not kept if this build fails)
   private usedPrevious = false;
+  // Why exports could not be reused at all, although imports could
+  private exportSkipped: string = null;
+  private failed = false;
   private notes: string[] = [];
 
   /** Something the summary should explain */
@@ -144,11 +171,14 @@ export class IncrementalBuild {
       return run();
     } catch (e) {
       const failed = `the export failed: ${e?.message}`;
-      session.abortReason = session.aborted ? `${session.abortReason}, then ${failed}` : failed;
+      session.abortReason =
+        session.abortReason != null ? `${session.abortReason}, then ${failed}` : failed;
       session.errors.push(`export: ${e?.stack ?? e}`);
-      session.dispose(!canRedo);
+      // Nothing was replayed if replaying was turned off, so the error is that of a normal build
+      const redo = canRedo && session.mayReplay;
+      session.dispose(!redo);
       incrementalHooks.session = null;
-      if (canRedo) {
+      if (redo) {
         return null;
       }
       throw e;
@@ -161,18 +191,24 @@ export class IncrementalBuild {
 
   /** Logs how much of the export was reused. */
   logSummary() {
+    const parse = this.parseCache;
+    const files = parse != null ? `${parse.hits} of ${parse.hits + parse.misses} files` : '';
     if (this.session == null) {
       if (this.disabled != null) {
         logger.info(`Incremental build: not used, ${this.disabled}.`);
+      } else if (this.exportSkipped != null) {
+        logger.info(
+          `Incremental build: reused ${files}, but no exports, as the build could not be identified (${this.exportSkipped}).`
+        );
+        this.logErrors();
       }
       return;
     }
     const stats = this.session.stats;
     const redo = this.redone ? ' (cached results did not apply; exported everything)' : '';
-    const parse = this.parseCache;
-    const files = parse != null ? `${parse.hits} of ${parse.hits + parse.misses} files, ` : '';
+    const failed = this.failed ? ', before the export failed' : '';
     logger.info(
-      `Incremental build: reused ${files}${stats.replayed} of ${stats.exported} exports${redo}.`
+      `Incremental build: reused ${files ? `${files}, ` : ''}${stats.replayed} of ${stats.exported} exports${redo}${failed}.`
     );
     const notes = [...(this.first?.notes ?? []), ...this.notes];
     if (!this.session.saveable) {
@@ -185,16 +221,26 @@ export class IncrementalBuild {
     if (this.store.corruptPayloads > 0) {
       notes.push(`removed ${this.store.corruptPayloads} corrupt file(s) from the cache`);
     }
+    if (this.store.readFailures > 0) {
+      notes.push(
+        `could not use ${this.store.readFailures} cached result(s) (first: ${this.store.readError})`
+      );
+    }
     if (this.store.writeError != null) {
       notes.push(`could not write to the cache (${this.store.writeError})`);
     }
     // Cache problems are reported as information, so the error and warning counts stay those of
     // a normal build
     notes.forEach(text => logger.info(`Incremental build: ${text}.`));
+    this.logErrors();
+  }
+
+  private logErrors() {
     const sessions = this.first === this.session ? [this.session] : [this.first, this.session];
-    sessions
-      .flatMap(session => session?.errors ?? [])
-      .forEach(error => logger.debug(`Incremental build: unexpected error ${error}`));
+    [
+      ...(this.parseCache?.errors ?? []),
+      ...sessions.flatMap(session => session?.errors ?? [])
+    ].forEach(error => logger.debug(`Incremental build: unexpected error ${error}`));
   }
 
   /** Saves what this build recorded, for the next build. Must be called after the output is written. */
@@ -203,10 +249,20 @@ export class IncrementalBuild {
     if (this.disabled != null) {
       return;
     }
+    const session = this.session;
     try {
-      const session = this.session;
       let exportState = session?.saveable ? session.getState() : null;
-      if (exportState == null && !this.usedPrevious && this.manifest?.globalKey === this.key) {
+      let globalKey = this.key ?? '';
+      if (this.exportSkipped != null) {
+        // Nothing is known about the exports, so keep what the previous build recorded; the next
+        // build checks whether it applies, as always
+        globalKey = this.manifest?.globalKey ?? '';
+        exportState = this.manifest?.export ?? null;
+      } else if (
+        exportState == null &&
+        !this.usedPrevious &&
+        this.manifest?.globalKey === this.key
+      ) {
         // Keep what the previous build recorded, if this build did not even try to use it (when it
         // did, it may be what made this build fail); it is checked before it is used, like any
         // record
@@ -214,7 +270,7 @@ export class IncrementalBuild {
       }
       const manifest: Manifest = {
         format: CACHE_FORMAT,
-        globalKey: this.key ?? '',
+        globalKey,
         parseKey: this.tool,
         export: exportState,
         parse: this.parseCache?.entries
@@ -231,19 +287,33 @@ export class IncrementalBuild {
         }
       }
       this.store.collectGarbage(referenced);
-      if (process.env.SUSHI_INCREMENTAL_DEBUG) {
-        fs.writeFileSync(
-          path.join(this.store.dir, 'last-run.json'),
-          JSON.stringify(
-            { ...session?.stats, redone: this.redone, abandoned: this.abandoned },
-            null,
-            2
-          )
+      if (this.store.cleanupError != null) {
+        logger.info(
+          `Incremental build: could not remove some unused files from the cache (${this.store.cleanupError}).`
         );
       }
     } catch (e) {
       // The cache is only an optimization; the next build will just do more work
       logger.info(`Incremental build: could not save the cache (${e.message}).`);
+    }
+    if (process.env.SUSHI_INCREMENTAL_DEBUG) {
+      try {
+        fs.writeFileSync(
+          path.join(this.store.dir, 'last-run.json'),
+          JSON.stringify(
+            {
+              ...session?.stats,
+              redone: this.redone,
+              failed: this.failed,
+              abandoned: this.abandoned
+            },
+            null,
+            2
+          )
+        );
+      } catch (e) {
+        logger.info(`Incremental build: could not write the debugging summary (${e.message}).`);
+      }
     }
   }
 
