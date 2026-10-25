@@ -87,9 +87,12 @@ describe('CacheStore', () => {
   });
 
   it('should keep files that another build may be using', () => {
-    const old = new Date(Date.now() - 60 * 1000);
+    const hours = (n: number) => new Date(Date.now() - n * 60 * 60 * 1000);
     fs.writeFileSync(path.join(dir, 'p', 'unused.json.gz'), zlib.gzipSync('"unused"'));
-    fs.utimesSync(path.join(dir, 'p', 'unused.json.gz'), old, old);
+    fs.utimesSync(path.join(dir, 'p', 'unused.json.gz'), hours(2), hours(2));
+    // used by another build half an hour ago
+    fs.writeFileSync(path.join(dir, 'p', 'recent.json.gz'), zlib.gzipSync('"recent"'));
+    fs.utimesSync(path.join(dir, 'p', 'recent.json.gz'), hours(0.5), hours(0.5));
     const later = new CacheStore(dir);
     later.open();
     // written after this build started, by another build
@@ -98,7 +101,33 @@ describe('CacheStore', () => {
     later.collectGarbage(new Set());
     expect(fs.readdirSync(path.join(dir, 'p')).sort()).toEqual([
       'other.json.gz',
+      'recent.json.gz',
       'x.json.gz.123.abc.tmp'
     ]);
+  });
+
+  it('should mark the payloads it uses as recently used', () => {
+    const ref = store.putPayload('"used"');
+    const file = path.join(dir, 'p', `${ref}.json.gz`);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    fs.utimesSync(file, old, old);
+    store.getPayload(ref);
+    expect(fs.statSync(file).mtimeMs).toBeGreaterThan(Date.now() - 60 * 1000);
+  });
+
+  it('should only remove payloads whose content is corrupt', () => {
+    const ref = store.putPayload('{"a":1}');
+    const file = path.join(dir, 'p', `${ref}.json.gz`);
+    // a file that cannot be read is not known to be corrupt
+    fs.unlinkSync(file);
+    fs.mkdirSync(file);
+    expect(() => store.getPayload(ref)).toThrow();
+    expect(fs.existsSync(file)).toBe(true);
+    expect(store.corruptPayloads).toBe(0);
+    fs.rmdirSync(file);
+    fs.writeFileSync(file, zlib.gzipSync('{"a":'));
+    expect(() => store.getPayload(ref)).toThrow();
+    expect(fs.existsSync(file)).toBe(false);
+    expect(store.corruptPayloads).toBe(1);
   });
 });

@@ -85,6 +85,8 @@ export interface ExportStats {
   reasons: Record<string, number>;
   /** Why each entity was exported rather than replayed */
   exportedBecause: Record<string, string>;
+  /** Unexpected errors in the session's own bookkeeping, with their stacks */
+  errors: string[];
 }
 
 const PKG_ARRAYS = [
@@ -223,6 +225,10 @@ export class ExportSession implements IncrementalSessionHooks {
   aborted = false;
   abortReason: string;
   readonly reasons: Record<string, number> = {};
+  /** Why exports from the previous build could not be replayed at all, if they could not */
+  readonly notes: string[] = [];
+  readonly errors: string[] = [];
+  private untracked = 0;
 
   constructor(
     private readonly store: PayloadStore,
@@ -231,16 +237,22 @@ export class ExportSession implements IncrementalSessionHooks {
     this.oldRecords = new Map(Object.entries(old?.records ?? {}));
     this.replayEnabled = old != null && !old.unstable;
     this.canAbort = this.replayEnabled;
+    if (old?.unstable) {
+      this.notes.push(
+        'exports were not reused, as a definition changed unexpectedly during the previous build'
+      );
+    }
   }
 
   get stats(): ExportStats {
     return {
-      exported: this.status.size,
+      exported: this.status.size + this.untracked,
       replayed: this.replayed.size,
       aborted: this.aborted,
       abortReason: this.abortReason,
       reasons: this.reasons,
-      exportedBecause: Object.fromEntries(this.exportedBecause)
+      exportedBecause: Object.fromEntries(this.exportedBecause),
+      errors: this.errors
     };
   }
 
@@ -277,6 +289,7 @@ export class ExportSession implements IncrementalSessionHooks {
       this.replayEnabled = false;
       this.saveable = false;
       this.abortReason = `could not prepare the export (${e?.message})`;
+      this.keepError('preparing the export', e);
     }
     this.installPackageHooks();
     this.installTankHooks();
@@ -296,8 +309,12 @@ export class ExportSession implements IncrementalSessionHooks {
     const add = (key: string, def: any, kind: EntityKind) => {
       if (this.keyToDef.has(key) || this.defToKey.has(def)) {
         // Two entities with the same key cannot be told apart, so nothing can be reused safely
+        if (this.replayEnabled) {
+          this.notes.push(`exports were not reused, as there are two definitions of ${key}`);
+        }
         this.replayEnabled = false;
         this.saveable = false;
+        this.abortReason = this.abortReason ?? `there are two definitions of ${key}`;
         return;
       }
       this.keyToDef.set(key, def);
@@ -353,8 +370,13 @@ export class ExportSession implements IncrementalSessionHooks {
       } catch (e) {
         // Which entries this Instance will use is unknown, so no replay can be trusted not to
         // change them
+        if (this.replayEnabled) {
+          this.notes.push(
+            `exports were not reused, as looking up ${def.instanceOf} failed (${e?.message})`
+          );
+        }
         this.replayEnabled = false;
-        this.reason(`could not look up ${def.instanceOf}: ${e?.message}`);
+        this.keepError(`looking up ${def.instanceOf}`, e);
       }
     };
     this.keyToDef.forEach((def, key) => {
@@ -702,6 +724,7 @@ export class ExportSession implements IncrementalSessionHooks {
     const key = this.defToKey.get(def);
     if (key == null || this.kindOfKey.get(key) !== kind) {
       // Not an entity from the tank (or not the kind we expect), so it cannot be tracked
+      this.untracked++;
       this.failStack('untracked export');
       if (parent?.mode === 'replay') {
         this.abort('untracked export during replay');
@@ -717,6 +740,7 @@ export class ExportSession implements IncrementalSessionHooks {
       try {
         plan = this.planReplay(key, kind as EntityKind, def, exporter, parent);
       } catch (e) {
+        this.keepError(`checking ${key}`, e);
         this.abort(`could not check ${key}: ${e?.message}`);
         if (this.aborted) {
           return undefined;
@@ -944,6 +968,7 @@ export class ExportSession implements IncrementalSessionHooks {
       try {
         this.finishRecord(frame, threw);
       } catch (e) {
+        this.keepError(`recording ${key}`, e);
         this.abort(`could not record ${key}: ${e?.message}`);
       }
     }
@@ -1565,6 +1590,7 @@ export class ExportSession implements IncrementalSessionHooks {
             const childDef = this.keyToDef.get(child);
             const childKind = this.kindOfKey.get(child);
             let childThrew = false;
+            let childError: any = null;
             try {
               if (childKind === 'sd') {
                 this.ctx.structureDefinitionExporter.exportStructDef(childDef);
@@ -1583,14 +1609,19 @@ export class ExportSession implements IncrementalSessionHooks {
                 }
                 childExporter.exportInstance(childDef);
               }
-            } catch {
+            } catch (e) {
               childThrew = true;
+              childError = e;
             }
             if (this.aborted) {
               break;
             }
             if (childThrew !== threw || this.status.get(child) !== 'd' || !this.sameOutput(child)) {
-              throw new AbortedError(`nested export of ${child} differs during replay`);
+              const error = childError != null ? ` (it threw: ${childError?.message})` : '';
+              if (childError != null) {
+                this.keepError(`replaying the nested export of ${child}`, childError);
+              }
+              throw new AbortedError(`nested export of ${child} differs during replay${error}`);
             }
             break;
           }
@@ -1602,6 +1633,7 @@ export class ExportSession implements IncrementalSessionHooks {
       if (e instanceof AbortedError) {
         this.abort(e.message);
       } else {
+        this.keepError(`replaying ${key}`, e);
         this.abort(`replay of ${key} failed: ${e?.message}`);
       }
     } finally {
@@ -1613,8 +1645,9 @@ export class ExportSession implements IncrementalSessionHooks {
     if (old.afterRef != null) {
       try {
         replaceOwnProperties(def, decode(this.store.getPayload(old.afterRef), this.defRegistry));
-      } catch {
-        this.abort(`could not restore ${key}`);
+      } catch (e) {
+        this.keepError(`restoring ${key}`, e);
+        this.abort(`could not restore ${key}: ${e?.message}`);
         return undefined;
       }
     }
@@ -1631,8 +1664,14 @@ export class ExportSession implements IncrementalSessionHooks {
     try {
       fn();
     } catch (e) {
+      this.keepError('bookkeeping', e);
       this.abort(`incremental bookkeeping failed: ${e?.message}`);
     }
+  }
+
+  /** Keeps an unexpected error, with its stack, for debugging. */
+  private keepError(during: string, e: any) {
+    this.errors.push(`while ${during}: ${e?.stack ?? e}`);
   }
 
   private abort(why: string) {

@@ -6,7 +6,8 @@ import { PayloadStore } from './ExportSession';
 
 export const CACHE_FORMAT = 1;
 
-const DAY = 24 * 60 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 
 export interface Manifest {
   format: number;
@@ -32,6 +33,8 @@ export class CacheStore implements PayloadStore {
   manifestProblem: string = null;
   /** The first failure to write to the cache, if any */
   writeError: string = null;
+  /** How many payloads were found corrupt (and removed) */
+  corruptPayloads = 0;
 
   constructor(readonly dir: string) {
     this.payloadDir = path.join(dir, 'p');
@@ -76,7 +79,9 @@ export class CacheStore implements PayloadStore {
 
   putPayload(json: string): string {
     const ref = hashString(json);
-    if (!this.known.has(ref)) {
+    if (this.known.has(ref)) {
+      this.touch(ref);
+    } else {
       try {
         this.writeGz(path.join(this.payloadDir, `${ref}.json.gz`), json);
       } catch (e) {
@@ -93,14 +98,20 @@ export class CacheStore implements PayloadStore {
       throw new Error('Invalid payload reference');
     }
     const file = path.join(this.payloadDir, `${ref}.json.gz`);
-    let json: string;
+    // Failing to read the file (it is missing, or the system refused) says nothing about its
+    // content, but content that does not unzip, match its hash or parse is corrupt
+    const data = fs.readFileSync(file);
     try {
-      json = this.readGz(file);
+      const json = zlib.gunzipSync(data).toString('utf8');
       if (hashString(json) !== ref) {
         throw new Error(`Corrupt cache payload ${ref}`);
       }
+      const value = JSON.parse(json);
+      this.touch(ref);
+      return value;
     } catch (e) {
       // Remove it, so it is written again if this build produces it
+      this.corruptPayloads++;
       this.known.delete(ref);
       try {
         fs.unlinkSync(file);
@@ -109,7 +120,16 @@ export class CacheStore implements PayloadStore {
       }
       throw e;
     }
-    return JSON.parse(json);
+  }
+
+  /** Marks a payload as in use, so a concurrent build does not collect it. */
+  private touch(ref: string) {
+    try {
+      const now = new Date();
+      fs.utimesSync(path.join(this.payloadDir, `${ref}.json.gz`), now, now);
+    } catch {
+      // it is only a hint
+    }
   }
 
   writeManifest(manifest: Manifest) {
@@ -122,8 +142,9 @@ export class CacheStore implements PayloadStore {
   }
 
   /**
-   * Deletes the payloads that are no longer referenced. Files changed since this build started, and
-   * temporary files less than a day old, may be in use by another build, so they are kept.
+   * Deletes the payloads that are no longer referenced. Payloads used or written in the last hour
+   * (or since this build started), and temporary files less than a day old, may be in use by
+   * another build, so they are kept.
    */
   collectGarbage(referenced: Set<string>) {
     for (const file of fs.readdirSync(this.payloadDir)) {
@@ -134,7 +155,8 @@ export class CacheStore implements PayloadStore {
       const full = path.join(this.payloadDir, file);
       try {
         const changed = fs.statSync(full).mtimeMs;
-        const keepAfter = ref == null ? Date.now() - DAY : this.startedAt;
+        const keepAfter =
+          ref == null ? Date.now() - DAY : Math.min(this.startedAt, Date.now() - HOUR);
         if (changed >= keepAfter) {
           continue;
         }

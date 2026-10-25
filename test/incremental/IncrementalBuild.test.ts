@@ -3,7 +3,7 @@ import path from 'path';
 import zlib from 'zlib';
 import temp from 'temp';
 import { exportFHIR, Package } from '../../src/export';
-import { RawFSH } from '../../src/import';
+import { FSHTank, RawFSH } from '../../src/import';
 import { FHIRDefinitions } from '../../src/fhirdefs';
 import { IncrementalBuild } from '../../src/incremental/IncrementalBuild';
 import { ExportSession } from '../../src/incremental/ExportSession';
@@ -69,10 +69,11 @@ describe('IncrementalBuild', () => {
     return { out: output(pkg), messages: messages() };
   }
 
-  function incrementalBuild(fsh = FSH, options: any = {}) {
+  function incrementalBuild(fsh = FSH, options: any = {}, change?: (tank: FSHTank) => void) {
     loggerSpy.reset();
     const build = new IncrementalBuild(projectDir, '9.9.9');
     const tank = build.importFSH(rawFSH(fsh), minimalConfig);
+    change?.(tank);
     const pkg = build.exportFHIR(tank, defs, options, minimalConfig);
     const result = { out: output(pkg), messages: messages() };
     build.logSummary();
@@ -169,20 +170,76 @@ describe('IncrementalBuild', () => {
     );
 
     it.each(['fishSignature', 'payloadOf', 'checkAfterExport'])(
-      'should build normally with a cache when %s fails, and keep the cache',
+      'should build normally with a cache when %s fails, and not use that cache again',
       method => {
         const expected = plainBuild();
         incrementalBuild();
         failIn(method);
         const second = incrementalBuild();
         expect({ out: second.out, messages: second.messages }).toEqual(expected);
+        // the cache this build used may be what made it fail, so the next build does not use it,
+        // and exports everything once
+        const third = incrementalBuild();
+        expect({ out: third.out, messages: third.messages }).toEqual(expected);
+        expect(third.summary).toBe('Incremental build: reused 4 of 4 files, 0 of 4 exports.');
+        expect(third.notes).toContain(
+          'Incremental build: exports were not reused, as the previous build could not save them.'
+        );
         spy.mockRestore();
         spy = null;
-        // what the first build recorded is still there to be used
+        incrementalBuild();
         expect(incrementalBuild().summary).toBe(
           'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
         );
       }
+    );
+
+    it('should keep the previous cache when it was not used', () => {
+      incrementalBuild();
+      // the definitions cannot be copied, so the cache is not used, and this build cannot be saved
+      failIn('payloadOf');
+      const second = incrementalBuild(FSH, {}, tank => ((tank.docs[0] as any).extra = () => 1));
+      expect(second.notes[0]).toMatch(/definitions could not be copied/);
+      spy.mockRestore();
+      spy = null;
+      expect(incrementalBuild().summary).toBe(
+        'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
+      );
+    });
+
+    it('should keep the stack of an unexpected error', () => {
+      failIn('checkAfterExport');
+      incrementalBuild();
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .some(m => /unexpected error while bookkeeping: Error: boom\n\s+at /.test(m))
+      ).toBe(true);
+    });
+  });
+
+  it('should say why nothing was reused when the options change', () => {
+    incrementalBuild();
+    const second = incrementalBuild(FSH, { snapshot: true });
+    expect(second.notes).toEqual([
+      'Incremental build: exports were not reused, as the options, configuration, dependencies or SUSHI changed.'
+    ]);
+  });
+
+  it('should not count cache problems as warnings', () => {
+    incrementalBuild();
+    const payloadDir = path.join(projectDir, '.sushi-cache', 'p');
+    fs.readdirSync(payloadDir).forEach(file =>
+      fs.writeFileSync(path.join(payloadDir, file), zlib.gzipSync('corrupt'))
+    );
+    const warningsBefore = stats.numWarn;
+    const expected = plainBuild();
+    const expectedWarnings = stats.numWarn - warningsBefore;
+    const second = incrementalBuild();
+    expect({ out: second.out, messages: second.messages }).toEqual(expected);
+    expect(stats.numWarn - warningsBefore).toBe(2 * expectedWarnings);
+    expect(second.notes.some(n => /removed \d+ corrupt file\(s\) from the cache/.test(n))).toBe(
+      true
     );
   });
 
