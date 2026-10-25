@@ -260,11 +260,24 @@ export class ExportSession implements IncrementalSessionHooks {
   beginExport(ctx: any): void {
     this.ctx = ctx;
     this.phase = 'main';
-    this.indexTank();
-    if (this.replayEnabled) {
-      this.pinSdCacheEntries();
-    }
+    // The logger goes first, so the lookups made while preparing can be kept quiet
     this.installLogger();
+    try {
+      this.indexTank();
+      if (this.replayEnabled) {
+        this.suppress++;
+        try {
+          this.pinSdCacheEntries();
+        } finally {
+          this.suppress--;
+        }
+      }
+    } catch (e) {
+      // Nothing has been exported yet, so just export everything and keep no record of it
+      this.replayEnabled = false;
+      this.saveable = false;
+      this.abortReason = `could not prepare the export (${e?.message})`;
+    }
     this.installPackageHooks();
     this.installTankHooks();
   }
@@ -337,8 +350,11 @@ export class ExportSession implements IncrementalSessionHooks {
         if (url != null) {
           this.pinnedUrls.add(url);
         }
-      } catch {
-        // the export will report it
+      } catch (e) {
+        // Which entries this Instance will use is unknown, so no replay can be trusted not to
+        // change them
+        this.replayEnabled = false;
+        this.reason(`could not look up ${def.instanceOf}: ${e?.message}`);
       }
     };
     this.keyToDef.forEach((def, key) => {
@@ -549,9 +565,12 @@ export class ExportSession implements IncrementalSessionHooks {
       return;
     }
     this.phase = 'post';
-    if (this.aborted) {
-      return;
+    if (!this.aborted) {
+      this.safely(() => this.checkAfterExport());
     }
+  }
+
+  private checkAfterExport(): void {
     // Definitions should only change while they are being exported, and the lookups recorded for
     // replay assume that the things that decide what a lookup finds do not change at all
     let unexpected: string = null;
@@ -699,7 +718,9 @@ export class ExportSession implements IncrementalSessionHooks {
         plan = this.planReplay(key, kind as EntityKind, def, exporter, parent);
       } catch (e) {
         this.abort(`could not check ${key}: ${e?.message}`);
-        return undefined;
+        if (this.aborted) {
+          return undefined;
+        }
       }
       if (plan != null) {
         return this.replay(key, kind as EntityKind, def, exporter, parent, ref, plan);

@@ -6,6 +6,8 @@ import { PayloadStore } from './ExportSession';
 
 export const CACHE_FORMAT = 1;
 
+const DAY = 24 * 60 * 60 * 1000;
+
 export interface Manifest {
   format: number;
   globalKey: string;
@@ -23,6 +25,13 @@ export interface Manifest {
 export class CacheStore implements PayloadStore {
   private readonly payloadDir: string;
   private readonly known = new Set<string>();
+  // Files changed after this may belong to another build running at the same time (with some
+  // slack, as file times can lag the clock slightly)
+  private readonly startedAt = Date.now() - 1000;
+  /** Why the manifest could not be used, if there was one */
+  manifestProblem: string = null;
+  /** The first failure to write to the cache, if any */
+  writeError: string = null;
 
   constructor(readonly dir: string) {
     this.payloadDir = path.join(dir, 'p');
@@ -35,13 +44,19 @@ export class CacheStore implements PayloadStore {
 
   /** Reads the manifest, or returns null if there is no usable one. */
   readManifest(): Manifest | null {
+    const file = path.join(this.dir, 'manifest.json.gz');
+    if (!fs.existsSync(file)) {
+      return null;
+    }
     try {
-      const manifest = JSON.parse(this.readGz(path.join(this.dir, 'manifest.json.gz')));
+      const manifest = JSON.parse(this.readGz(file));
       if (manifest?.format !== CACHE_FORMAT) {
+        this.manifestProblem = 'the cache was made by a different version of SUSHI';
         return null;
       }
       return manifest;
-    } catch {
+    } catch (e) {
+      this.manifestProblem = `the cache could not be read (${e.message})`;
       return null;
     }
   }
@@ -62,7 +77,12 @@ export class CacheStore implements PayloadStore {
   putPayload(json: string): string {
     const ref = hashString(json);
     if (!this.known.has(ref)) {
-      this.writeGz(path.join(this.payloadDir, `${ref}.json.gz`), json);
+      try {
+        this.writeGz(path.join(this.payloadDir, `${ref}.json.gz`), json);
+      } catch (e) {
+        this.writeError = this.writeError ?? e.message;
+        throw e;
+      }
       this.known.add(ref);
     }
     return ref;
@@ -72,28 +92,56 @@ export class CacheStore implements PayloadStore {
     if (!/^[A-Za-z0-9_-]+$/.test(ref)) {
       throw new Error('Invalid payload reference');
     }
-    const json = this.readGz(path.join(this.payloadDir, `${ref}.json.gz`));
-    if (hashString(json) !== ref) {
-      throw new Error(`Corrupt cache payload ${ref}`);
+    const file = path.join(this.payloadDir, `${ref}.json.gz`);
+    let json: string;
+    try {
+      json = this.readGz(file);
+      if (hashString(json) !== ref) {
+        throw new Error(`Corrupt cache payload ${ref}`);
+      }
+    } catch (e) {
+      // Remove it, so it is written again if this build produces it
+      this.known.delete(ref);
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        // already gone
+      }
+      throw e;
     }
     return JSON.parse(json);
   }
 
   writeManifest(manifest: Manifest) {
-    this.writeGz(path.join(this.dir, 'manifest.json.gz'), JSON.stringify(manifest));
+    try {
+      this.writeGz(path.join(this.dir, 'manifest.json.gz'), JSON.stringify(manifest));
+    } catch (e) {
+      this.writeError = this.writeError ?? e.message;
+      throw e;
+    }
   }
 
-  /** Deletes the payloads that are no longer referenced. */
+  /**
+   * Deletes the payloads that are no longer referenced. Files changed since this build started, and
+   * temporary files less than a day old, may be in use by another build, so they are kept.
+   */
   collectGarbage(referenced: Set<string>) {
     for (const file of fs.readdirSync(this.payloadDir)) {
       const ref = file.endsWith('.json.gz') ? file.slice(0, -'.json.gz'.length) : null;
-      if (ref == null || !referenced.has(ref)) {
-        try {
-          fs.unlinkSync(path.join(this.payloadDir, file));
-          this.known.delete(ref);
-        } catch {
-          // another build may have removed it already
+      if (ref != null && referenced.has(ref)) {
+        continue;
+      }
+      const full = path.join(this.payloadDir, file);
+      try {
+        const changed = fs.statSync(full).mtimeMs;
+        const keepAfter = ref == null ? Date.now() - DAY : this.startedAt;
+        if (changed >= keepAfter) {
+          continue;
         }
+        fs.unlinkSync(full);
+        this.known.delete(ref);
+      } catch {
+        // another build may have removed it already
       }
     }
   }

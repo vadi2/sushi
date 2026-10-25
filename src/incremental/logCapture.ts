@@ -66,3 +66,42 @@ export function captureLogs<T>(fn: () => T, mute: boolean): { result: T; logs: a
     }
   }
 }
+
+/**
+ * Holds back everything written to the logger until release is called, then writes it (in order)
+ * or drops it. Entries written while the importer collects messages from a generated document
+ * (logger level "emerg") are passed straight through, as they are never printed or counted.
+ */
+export function holdLogs(): { release(write: boolean): void } {
+  const ownWrite = Object.getOwnPropertyDescriptor(logger, 'write');
+  const write = logger.write;
+  const held: any[][] = [];
+  Object.defineProperty(logger, 'write', {
+    value: function (info: any, ...rest: any[]) {
+      if (logger.level === 'emerg') {
+        return write.call(logger, info, ...rest);
+      }
+      held.push([info, ...rest]);
+      return true;
+    },
+    configurable: true,
+    writable: true
+  });
+  let released = false;
+  return {
+    release(writeHeld: boolean) {
+      if (released) {
+        return;
+      }
+      released = true;
+      if (ownWrite != null) {
+        Object.defineProperty(logger, 'write', ownWrite);
+      } else {
+        delete (logger as any).write;
+      }
+      if (writeHeld) {
+        held.forEach(args => write.call(logger, ...args));
+      }
+    }
+  };
+}

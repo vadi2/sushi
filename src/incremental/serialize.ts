@@ -100,6 +100,11 @@ export function encode(value: any, registry: ClassRegistry): any {
       return { $s: items };
     } else if (proto === Date.prototype) {
       return { $d: v.getTime() };
+    } else if (proto === RegExp.prototype) {
+      if (Object.keys(v).length > 0) {
+        throw new UnserializableError('regular expression with extra properties');
+      }
+      return { $x: [v.source, v.flags, v.lastIndex] };
     } else if (ctorNames.has(proto)) {
       return { $c: ctorNames.get(proto), $v: encodeProps(v) };
     }
@@ -159,6 +164,11 @@ export function decode(encoded: any, registry: ClassRegistry): any {
       const date = new Date(e.$d);
       refs.push(date);
       return date;
+    } else if ('$x' in e) {
+      const regex = new RegExp(e.$x[0], e.$x[1]);
+      regex.lastIndex = e.$x[2];
+      refs.push(regex);
+      return regex;
     } else if ('$c' in e) {
       const ctor = registry.get(e.$c);
       if (ctor == null) {

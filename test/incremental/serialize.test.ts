@@ -57,6 +57,20 @@ describe('serialize', () => {
     expect(result.marker).toEqual({ $r: 1, $c: 'Point' });
   });
 
+  it('should keep regular expressions', () => {
+    const sticky = /a+/gy;
+    sticky.lastIndex = 2;
+    const value = { regex: /^http:\/\/[a-z]+$/i, sticky, again: sticky };
+    const result = roundTrip(value);
+    expect(result.regex).toBeInstanceOf(RegExp);
+    expect(result.regex.source).toBe(value.regex.source);
+    expect(result.regex.flags).toBe('i');
+    expect(result.sticky.flags).toBe('gy');
+    expect(result.sticky.lastIndex).toBe(2);
+    expect(result.again).toBe(result.sticky);
+    expect(hashValue(result, registry)).toBe(hashValue(value, registry));
+  });
+
   it('should keep class identity and property order', () => {
     const result = roundTrip(new Point(1, 2));
     expect(result).toBeInstanceOf(Point);
@@ -100,6 +114,8 @@ describe('serialize', () => {
       Instance: Pat
       InstanceOf: MyPatient
       * name.family = "Smith"
+      ValueSet: RegexVS
+      * include codes from system http://example.org where display regex /^A.*/
       `,
       'doc.fsh'
     );
@@ -111,6 +127,9 @@ describe('serialize', () => {
       doc.profiles.get('MyPatient').constructor
     );
     expect(hashValue(result, reg)).toBe(hashValue(doc, reg));
+    const filter = result.valueSets.get('RegexVS').rules[0].filters[0];
+    expect(filter.value).toBeInstanceOf(RegExp);
+    expect(filter.value.source).toBe('^A.*');
   });
 
   it('should replace the own properties of an object while keeping its identity', () => {

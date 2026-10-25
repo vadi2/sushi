@@ -21,7 +21,8 @@ function listFiles(dir: string, out: string[] = []): string[] {
       if (entry.name !== 'node_modules') {
         listFiles(full, out);
       }
-    } else if (entry.name.endsWith('.js')) {
+    } else if (/\.(c|m)?(js|ts)$/.test(entry.name)) {
+      // compiled files, or sources when run with a TypeScript loader
       out.push(full);
     }
   }
@@ -29,8 +30,9 @@ function listFiles(dir: string, out: string[] = []): string[] {
 }
 
 /**
- * Identifies the SUSHI build that is running: its version, the compiled files it is made of, and
- * the Node.js version running it. Parsed FSH is reusable only by the same build.
+ * Identifies the SUSHI build that is running: its version, the files it is made of (compiled, or
+ * TypeScript sources when it runs from them), and the Node.js version running it. Parsed FSH is
+ * reusable only by the same build.
  */
 export function toolKey(sushiVersion: string): string {
   const hash = createHash('sha256');
