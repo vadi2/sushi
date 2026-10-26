@@ -1050,14 +1050,16 @@ export class ExportSession implements IncrementalSessionHooks {
       if (rec.afterHash !== rec.pre) {
         try {
           rec.afterRef = this.store.putPayload(JSON.stringify(encode(frame.def, this.defRegistry)));
-        } catch {
+        } catch (e) {
+          this.storeFailed(frame.key, e);
           this.failRecord(rec, 'could not store definition');
         }
       }
       if (obj != null && rec.ok) {
         try {
           rec.payloadRef = this.store.putPayload(payload);
-        } catch {
+        } catch (e) {
+          this.storeFailed(frame.key, e);
           this.failRecord(rec, 'could not store result');
         }
         if (frame.kind === 'sd') {
@@ -1695,6 +1697,12 @@ export class ExportSession implements IncrementalSessionHooks {
       this.keepError('bookkeeping', e);
       this.abort(`incremental bookkeeping failed: ${e?.message}`);
     }
+  }
+
+  /** Keeps a failure to store a record's payload (only the first is reported as a write error). */
+  private storeFailed(key: string, e: any) {
+    this.keepError(`storing ${key}`, e);
+    this.store.writeFailed?.(e);
   }
 
   /** Keeps an unexpected error, with its stack, for debugging. */

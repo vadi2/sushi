@@ -201,6 +201,8 @@ export interface ImportCache {
   decodeDoc(encoded: any): FSHDocument;
   /** Notes an unexpected failure to use (or, if writing, to make) a cached import */
   failed?(during: string, e: any, writing?: boolean): void;
+  /** Notes why a file's import is not cached, when that is not a failure */
+  skipped?(file: string, why: string): void;
 }
 
 class DependencyRecorder {
@@ -208,7 +210,10 @@ class DependencyRecorder {
   private readonly seen = new Set<string>();
   failed = false;
 
-  constructor(private readonly hash: (value: any) => string) {}
+  constructor(
+    private readonly hash: (value: any) => string,
+    private readonly onError: (during: string, e: any) => void = () => {}
+  ) {}
 
   note(dependency: ImportDependency) {
     const key = JSON.stringify(dependency.slice(0, -1));
@@ -223,7 +228,11 @@ class DependencyRecorder {
     if (!this.seen.has(key)) {
       try {
         this.note(['ruleSet', name, this.hash(ruleSet ?? null)]);
-      } catch {
+      } catch (e) {
+        // the document is not cached, which is reported once
+        if (!this.failed) {
+          this.onError(`hashing the RuleSet ${name}`, e);
+        }
         this.failed = true;
       }
     }
@@ -405,7 +414,10 @@ export class FSHImporter extends FSHVisitor {
       this.currentDoc = liveDoc;
       this.currentFile = this.currentDoc.file ?? '';
       this.visitingDoc = liveDoc;
-      const dependencies = new DependencyRecorder(value => cache.hash(value));
+      const dependencies = new DependencyRecorder(
+        value => cache.hash(value),
+        (during, e) => cache.failed?.(`${during} for ${file.rawFSH.path}`, e, true)
+      );
       this.dependencies = dependencies;
       let visited: { logs: any[] | null };
       try {
@@ -416,7 +428,9 @@ export class FSHImporter extends FSHVisitor {
         this.currentDoc = null;
         this.currentFile = null;
       }
-      if (file.parseLogs != null && visited.logs != null && !dependencies.failed) {
+      if (file.parseLogs == null || visited.logs == null) {
+        cache.skipped?.(file.rawFSH.path, 'a message it logs could not be copied');
+      } else if (!dependencies.failed) {
         let encoded: any = null;
         try {
           encoded = cache.encodeDoc(liveDoc);

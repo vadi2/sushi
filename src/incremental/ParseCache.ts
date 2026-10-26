@@ -52,6 +52,12 @@ export class ParseCache implements ImportCache {
 
   /** Unexpected errors, with their stacks, for debugging */
   readonly errors: string[] = [];
+  /** Why some files were not cached, for debugging */
+  readonly skippedFiles: string[] = [];
+
+  skipped(file: string, why: string) {
+    this.skippedFiles.push(`did not cache the import of ${file}, as ${why}`);
+  }
 
   /** Keeps an unexpected error, and counts it as a failure to read or write the cache. */
   failed(during: string, e: any, writing = false) {

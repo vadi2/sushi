@@ -8,6 +8,7 @@ import { FHIRDefinitions } from '../../src/fhirdefs';
 import { IncrementalBuild } from '../../src/incremental/IncrementalBuild';
 import { ExportSession } from '../../src/incremental/ExportSession';
 import { ParseCache } from '../../src/incremental/ParseCache';
+import { CacheStore } from '../../src/incremental/CacheStore';
 import { InstanceExporter, StructureDefinitionExporter } from '../../src/export';
 import { incrementalHooks } from '../../src/incremental/hooks';
 import { fillTank } from '../../src/utils/Processing';
@@ -297,7 +298,7 @@ describe('IncrementalBuild', () => {
       expect({ out: second.out, messages: second.messages }).toEqual(expected);
       expect(stats.numError - errorsBefore).toBe(expectedErrors);
       expect(second.summary).toBe(
-        'Incremental build: reused 4 of 4 files, but no exports (cached results did not apply; exported everything without the cache).'
+        'Incremental build: imported all 4 files again, and reused no exports (cached results did not apply; exported everything without the cache).'
       );
       expect(second.notes[0]).toMatch(
         /^Incremental build: exported everything without the cache, because .*boom.*, and the definitions could not be copied \(no copy\)\.$/
@@ -334,7 +335,7 @@ describe('IncrementalBuild', () => {
       expect(second.summary).toMatch(/exported everything without the cache\)\.$/);
     });
 
-    it('should fail with the first error when building without the cache fails too', () => {
+    it("should fail with a normal build's error when building without the cache fails too", () => {
       incrementalBuild();
       spy = jest.spyOn(InstanceExporter.prototype, 'export').mockImplementation(() => {
         throw new Error(incrementalHooks.session != null ? 'first' : 'second');
@@ -344,7 +345,7 @@ describe('IncrementalBuild', () => {
         loggerSpy.reset();
         const build = new IncrementalBuild(projectDir, '9.9.9');
         const tank = build.importFSH(rawFSH(FSH), minimalConfig);
-        expect(() => build.exportFHIR(tank, defs, {}, minimalConfig)).toThrow('first');
+        expect(() => build.exportFHIR(tank, defs, {}, minimalConfig)).toThrow('second');
       } finally {
         copySpy.mockRestore();
       }
@@ -352,6 +353,12 @@ describe('IncrementalBuild', () => {
         loggerSpy
           .getAllMessages('info')
           .some(m => /without the cache\), before the export failed/.test(m))
+      ).toBe(true);
+      // the first attempt's error is kept for debugging
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .some(m => /unexpected error export: Error: first\n\s+at /.test(m))
       ).toBe(true);
     });
 
@@ -380,6 +387,41 @@ describe('IncrementalBuild', () => {
       expect(incrementalBuild().summary).toBe(
         'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
       );
+    });
+
+    it('should count a failure to record what an import used', () => {
+      const fsh = [
+        ...FSH,
+        'RuleSet: Named(family)\n* name.family = "{family}"\n',
+        'Instance: Pat2\nInstanceOf: Patient\n* insert Named(Jones)\n'
+      ];
+      spy = jest.spyOn(ParseCache.prototype, 'hash').mockImplementation(() => {
+        throw new Error('boom');
+      });
+      const first = incrementalBuild(fsh);
+      expect(first.notes).toContain('Incremental build: could not write to the cache (boom).');
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .filter(m =>
+            /unexpected error while hashing the RuleSet Named for .*: Error: boom/.test(m)
+          )
+      ).toHaveLength(1);
+    });
+
+    it('should keep a failure to store a recorded export', () => {
+      spy = jest.spyOn(CacheStore.prototype, 'putPayload').mockImplementation(() => {
+        throw new Error('boom');
+      });
+      const expected = plainBuild();
+      const first = incrementalBuild();
+      expect({ out: first.out, messages: first.messages }).toEqual(expected);
+      expect(first.notes).toContain('Incremental build: could not write to the cache (boom).');
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .some(m => /unexpected error while storing Profile:MyPatient: Error: boom/.test(m))
+      ).toBe(true);
     });
 
     it('should count a failure to cache an import', () => {
@@ -538,6 +580,17 @@ describe('IncrementalBuild', () => {
     fs.writeFileSync(summary, '{}');
     new IncrementalBuild(projectDir, '9.9.9');
     expect(fs.existsSync(summary)).toBe(false);
+  });
+
+  it('should use the cache when an earlier debugging summary cannot be removed', () => {
+    incrementalBuild();
+    const summary = path.join(projectDir, '.sushi-cache', 'last-run.json');
+    fs.mkdirSync(path.join(summary, 'inside'), { recursive: true });
+    const second = incrementalBuild();
+    expect(second.summary).toBe('Incremental build: reused 4 of 4 files, 4 of 4 exports.');
+    expect(second.notes).toContainEqual(
+      expect.stringMatching(/^Incremental build: could not remove the debugging summary/)
+    );
   });
 
   it('should keep the cache out of git', () => {

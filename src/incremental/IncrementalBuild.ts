@@ -34,11 +34,15 @@ export class IncrementalBuild {
     sushiVersion: string
   ) {
     this.store = CacheStore.forProject(projectDir);
+    // so a build that stops early does not leave the summary of an earlier one
+    try {
+      fs.rmSync(path.join(this.store.dir, 'last-run.json'), { force: true });
+    } catch (e) {
+      logger.info(`Incremental build: could not remove the debugging summary (${e.message}).`);
+    }
     try {
       this.tool = toolKey(sushiVersion);
       this.store.open();
-      // so a build that stops early does not leave the summary of an earlier one
-      fs.rmSync(path.join(this.store.dir, 'last-run.json'), { force: true });
       this.manifest = this.store.readManifest();
       if (this.store.manifestProblem != null) {
         this.note(`${this.store.manifestProblem}, so nothing was reused`);
@@ -145,6 +149,7 @@ export class IncrementalBuild {
       );
       this.session = null;
       this.fellBack = true;
+      this.redone = true;
       return this.exportWithoutCache(defs);
     }
     this.note(`exported everything again, because ${why}`);
@@ -167,14 +172,14 @@ export class IncrementalBuild {
       const tank = captureLogs(() => fillTank(this.source.rawFSH, this.source.config), true).result;
       return exportFHIR(tank, defs);
     } catch (e) {
-      // the first attempt's error is the one that explains what went wrong
-      throw this.firstError ?? e;
+      // this is the error a build without the cache shows; the first attempt's is kept for
+      // debugging, with its stack
+      this.first?.errors.push(`while exporting without the cache: ${e?.stack ?? e}`);
+      throw e;
     }
   }
 
   private abandoned: ExportStats = null;
-  // The error the first attempt failed with, if it did and was abandoned
-  private firstError: any = null;
   private fellBack = false;
   private first: ExportSession = null;
   // Whether the previous build's records were used (so they are not kept if this build fails)
@@ -208,7 +213,6 @@ export class IncrementalBuild {
       session.dispose(!redo);
       incrementalHooks.session = null;
       if (redo) {
-        this.firstError = e;
         return null;
       }
       throw e;
@@ -230,13 +234,16 @@ export class IncrementalBuild {
     const failed = this.failed ? ', before the export failed' : '';
     const session = this.session;
     const notes = [...(this.first?.notes ?? []), ...this.notes];
-    if (session == null) {
+    if (session == null && this.fellBack) {
+      const all = parse != null ? ` all ${parse.hits + parse.misses} files` : '';
+      logger.info(
+        `Incremental build: imported${all} again, and reused no exports (cached results did not apply; exported everything without the cache)${failed}.`
+      );
+    } else if (session == null) {
       const why =
         this.exportSkipped != null
           ? `, as the build could not be identified (${this.exportSkipped})`
-          : this.fellBack
-            ? ' (cached results did not apply; exported everything without the cache)'
-            : '';
+          : '';
       logger.info(`Incremental build: reused ${files}, but no exports${why}${failed}.`);
     } else {
       const stats = session.stats;
@@ -275,6 +282,7 @@ export class IncrementalBuild {
       ...(this.parseCache?.errors ?? []),
       ...sessions.flatMap(session => session?.errors ?? [])
     ].forEach(error => logger.debug(`Incremental build: unexpected error ${error}`));
+    this.parseCache?.skippedFiles.forEach(text => logger.debug(`Incremental build: ${text}.`));
   }
 
   /** Saves what this build recorded, for the next build. Must be called after the output is written. */
@@ -338,6 +346,7 @@ export class IncrementalBuild {
             {
               ...session?.stats,
               redone: this.redone,
+              fellBack: this.fellBack,
               failed: this.failed,
               abandoned: this.abandoned
             },
