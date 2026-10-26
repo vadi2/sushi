@@ -12,7 +12,7 @@ import { CACHE_FORMAT, CacheStore, Manifest } from './CacheStore';
 import { ExportSession, ExportState, ExportStats } from './ExportSession';
 import { exportKey, toolKey } from './cacheKey';
 import { decode, encode } from './serialize';
-import { holdLogs } from './logCapture';
+import { captureLogs, holdLogs } from './logCapture';
 import { definitionRegistry } from './registries';
 
 /**
@@ -37,6 +37,8 @@ export class IncrementalBuild {
     try {
       this.tool = toolKey(sushiVersion);
       this.store.open();
+      // so a build that stops early does not leave the summary of an earlier one
+      fs.rmSync(path.join(this.store.dir, 'last-run.json'), { force: true });
       this.manifest = this.store.readManifest();
       if (this.store.manifestProblem != null) {
         this.note(`${this.store.manifestProblem}, so nothing was reused`);
@@ -47,6 +49,7 @@ export class IncrementalBuild {
   }
 
   importFSH(rawFSH: RawFSH[], config: Configuration): FSHTank {
+    this.source = { rawFSH, config };
     if (this.disabled != null) {
       return fillTank(rawFSH, config);
     }
@@ -58,19 +61,20 @@ export class IncrementalBuild {
   }
 
   private parseCache: ParseCache = null;
+  private source: { rawFSH: RawFSH[]; config: Configuration } = null;
 
   exportFHIR(tank: FSHTank, defs: FHIRDefinitions, options: any, config: Configuration): Package {
-    if (this.disabled == null) {
-      try {
-        this.key = exportKey(this.tool, options, config, this.readConfigText(), defs);
-      } catch (e) {
-        this.exportSkipped = e.message;
-      }
-    }
-    if (this.disabled != null || this.exportSkipped != null) {
-      return exportFHIR(tank, defs);
-    }
     try {
+      if (this.disabled == null) {
+        try {
+          this.key = exportKey(this.tool, options, config, this.readConfigText(), defs);
+        } catch (e) {
+          this.exportSkipped = e.message;
+        }
+      }
+      if (this.disabled != null || this.exportSkipped != null) {
+        return exportFHIR(tank, defs);
+      }
       return this.exportWithSessions(tank, defs);
     } catch (e) {
       // The export fails as it would without the cache, but still say what happened, and do not
@@ -107,8 +111,9 @@ export class IncrementalBuild {
     const first = new ExportSession(this.store, old);
     this.first = first;
     this.session = first;
-    // If the export is redone, nothing the first attempt logged may be kept, including what is
-    // logged before the session starts (such as errors from applying insert rules)
+    // If the export is redone, nothing the first attempt logged may be kept. The session drops what
+    // it logged itself; this holds the rest, such as errors from applying insert rules before it
+    // begins.
     const held = old != null ? holdLogs() : null;
     let pkg: Package;
     try {
@@ -123,30 +128,54 @@ export class IncrementalBuild {
       held?.release(true);
       return pkg;
     }
+    // Nothing the first attempt did is kept: not its records, nor what it logged
+    held?.release(false);
+    first.dispose(false);
+    this.abandoned = first.stats;
     const why = first.abortReason ?? 'of an unknown problem';
     let copy: any[];
     try {
-      const reg = definitionRegistry();
-      copy = decode(JSON.parse(snapshot), reg);
+      copy = this.restoreSnapshot(snapshot);
     } catch (e) {
-      // Nothing can be done without the copy, so keep what the first attempt logged, to explain
+      // This should never happen, so do whatever a build without the cache would do, without
+      // depending on anything the first attempt used
       first.errors.push(`while copying the definitions: ${e?.stack ?? e}`);
-      held?.release(true);
-      this.note(`could not export everything again (${e.message}), after ${why}`);
-      throw e;
+      this.note(
+        `exported everything without the cache, because ${why}, and the definitions could not be copied (${e.message})`
+      );
+      this.session = null;
+      this.fellBack = true;
+      return this.exportWithoutCache(defs);
     }
-    held?.release(false);
     this.note(`exported everything again, because ${why}`);
     // Start over from the original definitions, and export everything without replaying
     this.redone = true;
     const fresh = new FSHTank(copy, tank.config);
     const second = new ExportSession(this.store, null);
     this.session = second;
-    this.abandoned = first.stats;
     return this.runSession(second, () => exportFHIR(fresh, defs), false);
   }
 
+  private restoreSnapshot(snapshot: string): any[] {
+    return decode(JSON.parse(snapshot), definitionRegistry());
+  }
+
+  /** Imports the FSH again, without the parse cache, and exports it as a normal build would. */
+  private exportWithoutCache(defs: FHIRDefinitions): Package {
+    try {
+      // what importing logs was already logged, when the FSH was first imported
+      const tank = captureLogs(() => fillTank(this.source.rawFSH, this.source.config), true).result;
+      return exportFHIR(tank, defs);
+    } catch (e) {
+      // the first attempt's error is the one that explains what went wrong
+      throw this.firstError ?? e;
+    }
+  }
+
   private abandoned: ExportStats = null;
+  // The error the first attempt failed with, if it did and was abandoned
+  private firstError: any = null;
+  private fellBack = false;
   private first: ExportSession = null;
   // Whether the previous build's records were used (so they are not kept if this build fails)
   private usedPrevious = false;
@@ -179,6 +208,7 @@ export class IncrementalBuild {
       session.dispose(!redo);
       incrementalHooks.session = null;
       if (redo) {
+        this.firstError = e;
         return null;
       }
       throw e;
@@ -191,32 +221,36 @@ export class IncrementalBuild {
 
   /** Logs how much of the export was reused. */
   logSummary() {
-    const parse = this.parseCache;
-    const files = parse != null ? `${parse.hits} of ${parse.hits + parse.misses} files` : '';
-    if (this.session == null) {
-      if (this.disabled != null) {
-        logger.info(`Incremental build: not used, ${this.disabled}.`);
-      } else if (this.exportSkipped != null) {
-        logger.info(
-          `Incremental build: reused ${files}, but no exports, as the build could not be identified (${this.exportSkipped}).`
-        );
-        this.logErrors();
-      }
+    if (this.disabled != null) {
+      logger.info(`Incremental build: not used, ${this.disabled}.`);
       return;
     }
-    const stats = this.session.stats;
-    const redo = this.redone ? ' (cached results did not apply; exported everything)' : '';
+    const parse = this.parseCache;
+    const files = parse != null ? `${parse.hits} of ${parse.hits + parse.misses} files` : '';
     const failed = this.failed ? ', before the export failed' : '';
-    logger.info(
-      `Incremental build: reused ${files ? `${files}, ` : ''}${stats.replayed} of ${stats.exported} exports${redo}${failed}.`
-    );
+    const session = this.session;
     const notes = [...(this.first?.notes ?? []), ...this.notes];
-    if (!this.session.saveable) {
-      notes.push(
-        `this build's exports cannot be reused (${this.session.abortReason ?? 'unknown reason'})`
+    if (session == null) {
+      const why =
+        this.exportSkipped != null
+          ? `, as the build could not be identified (${this.exportSkipped})`
+          : this.fellBack
+            ? ' (cached results did not apply; exported everything without the cache)'
+            : '';
+      logger.info(`Incremental build: reused ${files}, but no exports${why}${failed}.`);
+    } else {
+      const stats = session.stats;
+      const redo = this.redone ? ' (cached results did not apply; exported everything)' : '';
+      logger.info(
+        `Incremental build: reused ${files ? `${files}, ` : ''}${stats.replayed} of ${stats.exported} exports${redo}${failed}.`
       );
-    } else if (this.session.unstable) {
-      notes.push('the next build will not reuse exports, as a definition changed unexpectedly');
+      if (!session.saveable) {
+        notes.push(
+          `this build's exports cannot be reused (${session.abortReason ?? 'unknown reason'})`
+        );
+      } else if (session.unstable) {
+        notes.push('the next build will not reuse exports, as a definition changed unexpectedly');
+      }
     }
     if (this.store.corruptPayloads > 0) {
       notes.push(`removed ${this.store.corruptPayloads} corrupt file(s) from the cache`);
@@ -289,7 +323,7 @@ export class IncrementalBuild {
       this.store.collectGarbage(referenced);
       if (this.store.cleanupError != null) {
         logger.info(
-          `Incremental build: could not remove some unused files from the cache (${this.store.cleanupError}).`
+          `Incremental build: could not remove some files from the cache (${this.store.cleanupError}).`
         );
       }
     } catch (e) {

@@ -53,9 +53,14 @@ export class ParseCache implements ImportCache {
   /** Unexpected errors, with their stacks, for debugging */
   readonly errors: string[] = [];
 
-  private failed(during: string, e: any) {
+  /** Keeps an unexpected error, and counts it as a failure to read or write the cache. */
+  failed(during: string, e: any, writing = false) {
     this.errors.push(`while ${during}: ${e?.stack ?? e}`);
-    this.payloads.readFailed?.(e);
+    if (writing) {
+      this.payloads.writeFailed?.(e);
+    } else {
+      this.payloads.readFailed?.(e);
+    }
   }
 
   keep(file: string): void {
@@ -67,8 +72,9 @@ export class ParseCache implements ImportCache {
     try {
       const ref = this.payloads.putPayload(JSON.stringify(entry));
       this.entries[file] = { hash: hashString(content), ref };
-    } catch {
+    } catch (e) {
       // not cached; the file will just be imported again next time
+      this.failed(`storing the import of ${file}`, e, true);
     }
   }
 

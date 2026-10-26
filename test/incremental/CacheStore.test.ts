@@ -143,6 +143,29 @@ describe('CacheStore', () => {
     expect(store.getPayload(ref)).toEqual({ a: 1 });
   });
 
+  it('should count only the corrupt payloads it could remove', () => {
+    const ref = store.putPayload('{"a":1}');
+    const file = path.join(dir, 'p', `${ref}.json.gz`);
+    fs.writeFileSync(file, zlib.gzipSync('{"a":'));
+    const spy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+      throw Object.assign(new Error('not allowed'), { code: 'EPERM' });
+    });
+    try {
+      expect(() => store.getPayload(ref)).toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(store.corruptPayloads).toBe(0);
+    expect(store.cleanupError).toBe('not allowed');
+  });
+
+  it('should note a cache directory it cannot list', () => {
+    fs.rmSync(path.join(dir, 'p'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'p'), '');
+    store.collectGarbage(new Set());
+    expect(store.cleanupError).toMatch(/ENOTDIR/);
+  });
+
   it('should note unexpected failures to clean up', () => {
     const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
     // a file that is already gone is not a failure

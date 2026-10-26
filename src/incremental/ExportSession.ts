@@ -77,6 +77,8 @@ export interface PayloadStore {
   getPayload(ref: string): any;
   /** Notes that a cached result could not be used */
   readFailed?(e: any): void;
+  /** Notes that a result could not be cached */
+  writeFailed?(e: any): void;
 }
 
 export interface ExportStats {
@@ -250,8 +252,11 @@ export class ExportSession implements IncrementalSessionHooks {
 
   /** Whether anything may be replayed, so the export may have to be redone */
   get mayReplay(): boolean {
-    return this.canAbort && this.replayEnabled;
+    return this.started && this.canAbort && this.replayEnabled;
   }
+
+  // Whether the export has begun, so that something may have been replayed
+  private started = false;
 
   get stats(): ExportStats {
     return {
@@ -281,6 +286,7 @@ export class ExportSession implements IncrementalSessionHooks {
   beginExport(ctx: any): void {
     this.ctx = ctx;
     this.phase = 'main';
+    this.started = true;
     // The logger goes first, so the lookups made while preparing can be kept quiet
     this.installLogger();
     try {

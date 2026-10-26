@@ -7,6 +7,8 @@ import { FSHTank, RawFSH } from '../../src/import';
 import { FHIRDefinitions } from '../../src/fhirdefs';
 import { IncrementalBuild } from '../../src/incremental/IncrementalBuild';
 import { ExportSession } from '../../src/incremental/ExportSession';
+import { ParseCache } from '../../src/incremental/ParseCache';
+import { InstanceExporter, StructureDefinitionExporter } from '../../src/export';
 import { incrementalHooks } from '../../src/incremental/hooks';
 import { fillTank } from '../../src/utils/Processing';
 import { stats } from '../../src/utils/FSHLogger';
@@ -270,6 +272,129 @@ describe('IncrementalBuild', () => {
       );
     });
 
+    function failToCopy() {
+      return jest
+        .spyOn(IncrementalBuild.prototype as any, 'restoreSnapshot')
+        .mockImplementation(() => {
+          throw new Error('no copy');
+        });
+    }
+
+    it('should build without the cache when it cannot start over after abandoning a replay', () => {
+      let errorsBefore = stats.numError;
+      const expected = plainBuild();
+      const expectedErrors = stats.numError - errorsBefore;
+      incrementalBuild();
+      failIn('checkAfterExport');
+      const copySpy = failToCopy();
+      errorsBefore = stats.numError;
+      let second: ReturnType<typeof incrementalBuild>;
+      try {
+        second = incrementalBuild();
+      } finally {
+        copySpy.mockRestore();
+      }
+      expect({ out: second.out, messages: second.messages }).toEqual(expected);
+      expect(stats.numError - errorsBefore).toBe(expectedErrors);
+      expect(second.summary).toBe(
+        'Incremental build: reused 4 of 4 files, but no exports (cached results did not apply; exported everything without the cache).'
+      );
+      expect(second.notes[0]).toMatch(
+        /^Incremental build: exported everything without the cache, because .*boom.*, and the definitions could not be copied \(no copy\)\.$/
+      );
+      // nothing the abandoned attempt recorded is kept
+      spy.mockRestore();
+      spy = null;
+      expect(incrementalBuild().notes).toContain(
+        'Incremental build: exports were not reused, as the previous build could not save them.'
+      );
+    });
+
+    it('should build without the cache when it cannot start over after an export failed', () => {
+      const expected = plainBuild();
+      incrementalBuild();
+      // fails only while the cache is used
+      const real = InstanceExporter.prototype.export;
+      spy = jest.spyOn(InstanceExporter.prototype, 'export').mockImplementation(function (
+        this: InstanceExporter
+      ) {
+        if (incrementalHooks.session != null) {
+          throw new Error('first');
+        }
+        return real.call(this);
+      });
+      const copySpy = failToCopy();
+      let second: ReturnType<typeof incrementalBuild>;
+      try {
+        second = incrementalBuild();
+      } finally {
+        copySpy.mockRestore();
+      }
+      expect({ out: second.out, messages: second.messages }).toEqual(expected);
+      expect(second.summary).toMatch(/exported everything without the cache\)\.$/);
+    });
+
+    it('should fail with the first error when building without the cache fails too', () => {
+      incrementalBuild();
+      spy = jest.spyOn(InstanceExporter.prototype, 'export').mockImplementation(() => {
+        throw new Error(incrementalHooks.session != null ? 'first' : 'second');
+      });
+      const copySpy = failToCopy();
+      try {
+        loggerSpy.reset();
+        const build = new IncrementalBuild(projectDir, '9.9.9');
+        const tank = build.importFSH(rawFSH(FSH), minimalConfig);
+        expect(() => build.exportFHIR(tank, defs, {}, minimalConfig)).toThrow('first');
+      } finally {
+        copySpy.mockRestore();
+      }
+      expect(
+        loggerSpy
+          .getAllMessages('info')
+          .some(m => /without the cache\), before the export failed/.test(m))
+      ).toBe(true);
+    });
+
+    it('should not export again when the export fails before it begins', () => {
+      incrementalBuild();
+      spy = jest
+        .spyOn(StructureDefinitionExporter.prototype, 'applyInsertRules')
+        .mockImplementation(() => {
+          throw new Error('early');
+        });
+      const exportSpy = jest.spyOn(InstanceExporter.prototype, 'export');
+      try {
+        loggerSpy.reset();
+        const build = new IncrementalBuild(projectDir, '9.9.9');
+        const tank = build.importFSH(rawFSH(FSH), minimalConfig);
+        expect(() => build.exportFHIR(tank, defs, {}, minimalConfig)).toThrow('early');
+        expect(exportSpy).not.toHaveBeenCalled();
+      } finally {
+        exportSpy.mockRestore();
+      }
+      const own = loggerSpy.getAllMessages('info').filter(m => m.startsWith('Incremental build:'));
+      expect(own.some(m => /exported everything again/.test(m))).toBe(false);
+      // the cache was not used, so it is kept
+      spy.mockRestore();
+      spy = null;
+      expect(incrementalBuild().summary).toBe(
+        'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
+      );
+    });
+
+    it('should count a failure to cache an import', () => {
+      spy = jest.spyOn(ParseCache.prototype, 'encodeDoc').mockImplementation(() => {
+        throw new Error('boom');
+      });
+      const first = incrementalBuild();
+      expect(first.notes).toContain('Incremental build: could not write to the cache (boom).');
+      expect(
+        loggerSpy
+          .getAllMessages('debug')
+          .some(m => /unexpected error while encoding the import of .*: Error: boom/.test(m))
+      ).toBe(true);
+    });
+
     it('should keep the previous cache when it was not used', () => {
       incrementalBuild();
       // the definitions cannot be copied, so the cache is not used, and this build cannot be saved
@@ -380,6 +505,39 @@ describe('IncrementalBuild', () => {
     expect(incrementalBuild().summary).toBe(
       'Incremental build: reused 4 of 4 files, 4 of 4 exports.'
     );
+  });
+
+  it('should report the cache when the build cannot be identified and the export fails', () => {
+    incrementalBuild();
+    const payloadDir = path.join(projectDir, '.sushi-cache', 'p');
+    fs.readdirSync(payloadDir).forEach(file => fs.unlinkSync(path.join(payloadDir, file)));
+    const config = path.join(projectDir, 'sushi-config.yaml');
+    fs.unlinkSync(config);
+    fs.mkdirSync(config);
+    const spy = jest.spyOn(InstanceExporter.prototype, 'export').mockImplementation(() => {
+      throw new Error('boom');
+    });
+    try {
+      loggerSpy.reset();
+      const build = new IncrementalBuild(projectDir, '9.9.9');
+      const tank = build.importFSH(rawFSH(FSH), minimalConfig);
+      expect(() => build.exportFHIR(tank, defs, {}, minimalConfig)).toThrow('boom');
+    } finally {
+      spy.mockRestore();
+    }
+    const own = loggerSpy.getAllMessages('info').filter(m => m.startsWith('Incremental build:'));
+    expect(own[0]).toMatch(
+      /^Incremental build: reused 0 of 4 files, but no exports, as the build could not be identified \(.*\), before the export failed\.$/
+    );
+    expect(own).toContainEqual(expect.stringMatching(/could not use \d+ cached result\(s\)/));
+  });
+
+  it('should remove the debugging summary of an earlier build', () => {
+    incrementalBuild();
+    const summary = path.join(projectDir, '.sushi-cache', 'last-run.json');
+    fs.writeFileSync(summary, '{}');
+    new IncrementalBuild(projectDir, '9.9.9');
+    expect(fs.existsSync(summary)).toBe(false);
   });
 
   it('should keep the cache out of git', () => {

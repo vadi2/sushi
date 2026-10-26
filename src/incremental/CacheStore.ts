@@ -122,14 +122,26 @@ export class CacheStore implements PayloadStore {
       return value;
     } catch (e) {
       // Remove it, so it is written again if this build produces it
-      this.corruptPayloads++;
       this.known.delete(ref);
       try {
         fs.unlinkSync(file);
-      } catch {
-        // already gone
+        this.corruptPayloads++;
+      } catch (err) {
+        this.cleanupFailed(err);
       }
       throw e;
+    }
+  }
+
+  /** Notes that a result could not be cached. */
+  writeFailed(e: any) {
+    this.writeError = this.writeError ?? e?.message ?? String(e);
+  }
+
+  /** Notes a failure to remove a file, unless another build already removed it. */
+  private cleanupFailed(e: any) {
+    if (e?.code !== 'ENOENT') {
+      this.cleanupError = this.cleanupError ?? e?.message ?? String(e);
     }
   }
 
@@ -172,7 +184,14 @@ export class CacheStore implements PayloadStore {
    * another build, so they are kept.
    */
   collectGarbage(referenced: Set<string>) {
-    for (const file of fs.readdirSync(this.payloadDir)) {
+    let files: string[];
+    try {
+      files = fs.readdirSync(this.payloadDir);
+    } catch (e) {
+      this.cleanupFailed(e);
+      return;
+    }
+    for (const file of files) {
       const ref = file.endsWith('.json.gz') ? file.slice(0, -'.json.gz'.length) : null;
       if (ref != null && referenced.has(ref)) {
         continue;
@@ -189,9 +208,7 @@ export class CacheStore implements PayloadStore {
         this.known.delete(ref);
       } catch (e) {
         // another build may have removed it already
-        if (e?.code !== 'ENOENT') {
-          this.cleanupError = this.cleanupError ?? e?.message ?? String(e);
-        }
+        this.cleanupFailed(e);
       }
     }
   }

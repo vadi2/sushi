@@ -199,6 +199,8 @@ export interface ImportCache {
   hash(value: any): string;
   encodeDoc(doc: FSHDocument): any;
   decodeDoc(encoded: any): FSHDocument;
+  /** Notes an unexpected failure to use (or, if writing, to make) a cached import */
+  failed?(during: string, e: any, writing?: boolean): void;
 }
 
 class DependencyRecorder {
@@ -379,6 +381,12 @@ export class FSHImporter extends FSHVisitor {
         } catch {
           doc = null;
         }
+        if (doc != null && !(doc instanceof FSHDocument && doc.file === liveDoc.file)) {
+          cache.failed?.(
+            `using the cached import of ${file.rawFSH.path}`,
+            new Error('the cached document does not match')
+          );
+        }
         if (doc instanceof FSHDocument && doc.file === liveDoc.file) {
           // aliases are collected during preprocessing, which already ran for this build
           doc.aliases.clear();
@@ -412,8 +420,9 @@ export class FSHImporter extends FSHVisitor {
         let encoded: any = null;
         try {
           encoded = cache.encodeDoc(liveDoc);
-        } catch {
+        } catch (e) {
           encoded = null;
+          cache.failed?.(`encoding the import of ${file.rawFSH.path}`, e, true);
         }
         if (encoded != null) {
           cache.store(file.rawFSH.path, file.content, {
@@ -473,7 +482,8 @@ export class FSHImporter extends FSHVisitor {
             return false;
         }
       });
-    } catch {
+    } catch (e) {
+      cache.failed?.(`checking what the cached import of ${doc.file} used`, e);
       return false;
     }
   }
