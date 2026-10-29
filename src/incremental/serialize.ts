@@ -196,3 +196,16 @@ export function hashString(s: string): string {
 export function hashValue(value: any, registry: ClassRegistry): string {
   return hashString(JSON.stringify(encode(value, registry)));
 }
+
+/**
+ * Replaces all of target's own enumerable properties with those of source, keeping target's
+ * identity (other objects may hold references to it) and the property order of source.
+ */
+export function replaceOwnProperties(target: any, source: any): void {
+  for (const key of Object.keys(target)) {
+    delete target[key];
+  }
+  for (const key of Object.keys(source)) {
+    target[key] = source[key];
+  }
+}

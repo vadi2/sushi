@@ -3,7 +3,8 @@ import {
   buildClassRegistry,
   decode,
   encode,
-  hashValue
+  hashValue,
+  replaceOwnProperties
 } from '../../src/incremental/serialize';
 import { definitionRegistry } from '../../src/incremental/registries';
 import { importSingleText } from '../testhelpers';
@@ -140,5 +141,14 @@ describe('serialize', () => {
     const filter = result.valueSets.get('RegexVS').rules[0].filters[0];
     expect(filter.value).toBeInstanceOf(RegExp);
     expect(filter.value.source).toBe('^A.*');
+  });
+
+  it('should replace the own properties of an object while keeping its identity', () => {
+    const target: any = new Point(1, 2);
+    const ref = target;
+    replaceOwnProperties(target, { y: 3, z: 4 });
+    expect(ref).toBe(target);
+    expect(Object.keys(target)).toEqual(['y', 'z']);
+    expect(target.sum()).toBeNaN();
   });
 });

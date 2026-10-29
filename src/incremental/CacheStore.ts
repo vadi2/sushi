@@ -20,7 +20,9 @@ export interface PayloadStore {
 
 export interface Manifest {
   format: number;
+  globalKey: string;
   parseKey: string;
+  export?: any;
   parse?: any;
 }
 

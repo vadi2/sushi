@@ -38,6 +38,22 @@ export class Package implements Fishable {
     return this.internalFish(item, types, false);
   }
 
+  /**
+   * Finds every definition in the package that matches the item, for each of the requested types,
+   * in the order that fish and fishAll consider them. fish returns the first of these, and fishAll
+   * returns the first match for each type. Incremental builds use the full list to tell whether a
+   * lookup would still give the same answer.
+   */
+  findAllMatches(item: string, ...types: Type[]): PackageDefinition[] {
+    const results: PackageDefinition[] = [];
+    for (const candidates of this.getCandidates(item, types)) {
+      for (const [list, matches] of candidates) {
+        results.push(...list.filter(matches));
+      }
+    }
+    return results;
+  }
+
   private internalFish(
     item: string,
     types: Type[],

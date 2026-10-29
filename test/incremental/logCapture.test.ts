@@ -1,4 +1,4 @@
-import { captureLogs, copyLogInfo, emitLogInfo } from '../../src/incremental/logCapture';
+import { captureLogs, copyLogInfo, emitLogInfo, holdLogs } from '../../src/incremental/logCapture';
 import { logger, restoreMainLogger, switchToSecretLogger } from '../../src/utils/FSHLogger';
 import { loggerSpy } from '../testhelpers';
 
@@ -89,6 +89,43 @@ describe('logCapture', () => {
       expect(outer.logs.map(l => l.message)).toEqual(['outer', 'still captured']);
       expect(logger.write).toBe(write);
       expect(Object.getOwnPropertyDescriptor(logger, 'write')).toBeUndefined();
+    });
+  });
+
+  describe('#holdLogs', () => {
+    it('should hold entries until released, then write them or drop them', () => {
+      const held = holdLogs();
+      logger.warn('kept');
+      expect(loggerSpy.getAllLogs()).toHaveLength(0);
+      held.release(true);
+      held.release(true);
+      expect(loggerSpy.getAllLogs().map(l => l.message)).toEqual(['kept']);
+
+      const dropped = holdLogs();
+      logger.warn('dropped');
+      dropped.release(false);
+      expect(loggerSpy.getAllLogs()).toHaveLength(1);
+    });
+
+    it('should pass entries for the secret logger straight through', () => {
+      const held = holdLogs();
+      const saved = switchToSecretLogger();
+      logger.error('collected');
+      const collected = restoreMainLogger(saved);
+      held.release(false);
+      expect(collected.errors.map(e => e.message)).toEqual(['collected']);
+    });
+
+    it('should restore a capture it was nested in', () => {
+      const write = logger.write;
+      const { logs } = captureLogs(() => {
+        const held = holdLogs();
+        logger.warn('inner');
+        held.release(true);
+        logger.warn('outer');
+      }, true);
+      expect(logs.map(l => l.message)).toEqual(['inner', 'outer']);
+      expect(logger.write).toBe(write);
     });
   });
 });

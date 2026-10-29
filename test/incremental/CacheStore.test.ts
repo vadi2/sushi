@@ -56,13 +56,13 @@ describe('CacheStore', () => {
 
   it('should read back the manifest it wrote', () => {
     expect(store.readManifest()).toBeNull();
-    const manifest = { format: CACHE_FORMAT, parseKey: 'p', parse: { x: 1 } };
+    const manifest = { format: CACHE_FORMAT, globalKey: 'g', parseKey: 'p', parse: { x: 1 } };
     store.writeManifest(manifest);
     expect(store.readManifest()).toEqual(manifest);
   });
 
   it('should ignore a manifest of another format, or one that cannot be read', () => {
-    store.writeManifest({ format: CACHE_FORMAT + 1, parseKey: 'p' });
+    store.writeManifest({ format: CACHE_FORMAT + 1, globalKey: 'g', parseKey: 'p' });
     expect(store.readManifest()).toBeNull();
     expect(store.manifestProblem).toMatch(/different version/);
     fs.writeFileSync(path.join(dir, 'manifest.json.gz'), zlib.gzipSync('{not json'));
@@ -190,7 +190,9 @@ describe('CacheStore', () => {
 
   it('should note a manifest it cannot write, leaving no temporary file', () => {
     fs.mkdirSync(path.join(dir, 'manifest.json.gz'));
-    expect(() => store.writeManifest({ format: CACHE_FORMAT, parseKey: 'p', parse: {} })).toThrow();
+    expect(() =>
+      store.writeManifest({ format: CACHE_FORMAT, globalKey: 'g', parseKey: 'p', parse: {} })
+    ).toThrow();
     expect(store.writeError).not.toBeNull();
     expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
   });

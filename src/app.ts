@@ -330,8 +330,16 @@ async function runBuild(input: string, program: OptionValues, helpText: string) 
   // }
 
   logger.info('Converting FSH to FHIR resources...');
-  const outPackage = exportFHIR(tank, defs);
-  incremental?.logSummary();
+  let outPackage: Package;
+  if (incremental) {
+    // the cache is reusable whether it was turned on by the option or the environment variable
+    const buildOptions = { ...program };
+    delete buildOptions.incremental;
+    outPackage = incremental.exportFHIR(tank, defs, buildOptions, config);
+    incremental.logSummary();
+  } else {
+    outPackage = exportFHIR(tank, defs);
+  }
   const { skippedResources } = writeFHIRResources(outDir, outPackage, defs, program.snapshot);
   writeFSHIndex(outDir, outPackage, input, skippedResources);
   incremental?.finish();

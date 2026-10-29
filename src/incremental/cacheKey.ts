@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
+import { FHIRDefinitions } from '../fhirdefs';
+import { Configuration } from '../fshtypes';
 import { CACHE_FORMAT } from './CacheStore';
 
 export function fileStamp(file: string): string {
@@ -33,5 +35,43 @@ export function toolKey(sushiVersion: string): string {
   for (const file of listFiles(distDir)) {
     hash.update(`${path.relative(distDir, file)}:${fileStamp(file)}\n`);
   }
+  return hash.digest('base64url');
+}
+
+/**
+ * Identifies everything other than the FSH itself that the export depends on: the SUSHI build,
+ * the command line options, the configuration, and every loaded dependency and predefined
+ * resource. Exported results are reusable only when all of these are unchanged.
+ */
+export function exportKey(
+  tool: string,
+  options: any,
+  config: Configuration,
+  configText: string,
+  defs: FHIRDefinitions
+): string {
+  const hash = createHash('sha256');
+  const update = (label: string, value: string) =>
+    hash.update(`${label}:${value.length}:${value}\n`);
+  update('tool', tool);
+  update('options', JSON.stringify(options ?? {}));
+  update('config', JSON.stringify(config ?? null));
+  update('configText', configText ?? '');
+  for (const info of defs.findPackageInfos('*')) {
+    update(
+      'package',
+      JSON.stringify([info.name, info.version, info.packagePath, info.packageJSONPath])
+    );
+    if (info.packageJSONPath && fs.existsSync(info.packageJSONPath)) {
+      update('packageJSON', fileStamp(info.packageJSONPath));
+    }
+  }
+  for (const info of defs.findResourceInfos('*')) {
+    update('resource', JSON.stringify(info));
+    if (info.resourcePath && fs.existsSync(info.resourcePath)) {
+      update('resourceFile', fileStamp(info.resourcePath));
+    }
+  }
+  update('predefined', JSON.stringify(defs.allPredefinedResources()));
   return hash.digest('base64url');
 }
