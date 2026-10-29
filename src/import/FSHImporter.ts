@@ -145,7 +145,7 @@ type PreprocessedRuleSet = {
   contents: string;
   location: TextLocation;
 };
-type PreprocessedItem = PreprocessedAlias | PreprocessedRuleSet;
+export type PreprocessedItem = PreprocessedAlias | PreprocessedRuleSet;
 
 type DocumentCollection =
   | 'profiles'
@@ -160,6 +160,98 @@ type DocumentCollection =
   | 'mappings';
 
 /**
+ * Something a document's import used that comes from outside the document itself: whether an
+ * alias exists and what it is, a parameterized RuleSet (by hash), or whether an entity with the
+ * same name was already imported from another document.
+ */
+export type ImportDependency =
+  | ['aliasHas', string, boolean]
+  | ['aliasGet', string, string | null]
+  | ['ruleSet', string, string]
+  | ['duplicate', DocumentCollection, string, boolean];
+
+/** What importing one file produced, for reuse by a later incremental build. */
+export interface CachedImport {
+  parseLogs: any[];
+  items: PreprocessedItem[];
+  dependencies: ImportDependency[];
+  visitLogs: any[];
+  doc: any;
+}
+
+/**
+ * Lets FSHImporter reuse the results of importing unchanged files. Logs are captured as copies,
+ * so they can be written again exactly as they were.
+ */
+export interface ImportCache {
+  lookup(file: string, content: string): CachedImport | null;
+  keep(file: string): void;
+  store(file: string, content: string, entry: CachedImport): void;
+  capture<T>(fn: () => T, mute: boolean): { result: T; logs: any[] | null };
+  emit(logs: any[]): void;
+  hash(value: any): string;
+  encodeDoc(doc: FSHDocument): any;
+  /** Decodes a cached document, or returns null (having noted the failure) if it can't be */
+  decodeDoc(encoded: any): FSHDocument | null;
+  /** Notes an unexpected failure to use (or, if writing, to make) a cached import */
+  failed(during: string, e: any, writing?: boolean): void;
+  /** Notes why a file's import is not cached, when that is not a failure */
+  skipped(file: string, why: string): void;
+}
+
+class DependencyRecorder {
+  readonly list: ImportDependency[] = [];
+  private readonly seen = new Set<string>();
+  failed = false;
+
+  constructor(
+    private readonly hash: (value: any) => string,
+    private readonly onError: (during: string, e: any) => void
+  ) {}
+
+  note(dependency: ImportDependency) {
+    const key = JSON.stringify(dependency.slice(0, -1));
+    if (!this.seen.has(key)) {
+      this.seen.add(key);
+      this.list.push(dependency);
+    }
+  }
+
+  noteRuleSet(name: string, ruleSet: ParamRuleSet) {
+    const key = JSON.stringify(['ruleSet', name]);
+    if (!this.seen.has(key)) {
+      try {
+        this.note(['ruleSet', name, this.hash(ruleSet ?? null)]);
+      } catch (e) {
+        // the document is not cached, which is reported once
+        if (!this.failed) {
+          this.onError(`hashing the RuleSet ${name}`, e);
+        }
+        this.failed = true;
+      }
+    }
+  }
+}
+
+/** A Map that reports reads of it, so the importer can tell what a document depended on. */
+class ObservedMap<V> extends Map<string, V> {
+  onHas: (key: string, result: boolean) => void = null;
+  onGet: (key: string, result: V) => void = null;
+
+  has(key: string): boolean {
+    const result = super.has(key);
+    this.onHas?.(key, result);
+    return result;
+  }
+
+  get(key: string): V {
+    const result = super.get(key);
+    this.onGet?.(key, result);
+    return result;
+  }
+}
+
+/**
  * FSHImporter handles the parsing of FSH documents, constructing the data into FSH types.
  * FSHImporter uses a visitor pattern approach with some accomodations due to the ANTLR4
  * implementation and TypeScript requirements.  For example, the `accept` functions that
@@ -168,6 +260,9 @@ type DocumentCollection =
  */
 export class FSHImporter extends FSHVisitor {
   private docs: FSHDocument[] = [];
+  private caughtRangeError = false;
+  private dependencies: DependencyRecorder = null;
+  private visitingDoc: FSHDocument = null;
   private currentFile: string;
   private currentDoc: FSHDocument;
   private allAliases: Map<string, string>;
@@ -181,7 +276,10 @@ export class FSHImporter extends FSHVisitor {
     this.topLevelParse = true;
   }
 
-  import(rawFSHes: RawFSH[]): FSHDocument[] {
+  import(rawFSHes: RawFSH[], cache?: ImportCache): FSHDocument[] {
+    if (cache != null) {
+      return this.importWithCache(rawFSHes, cache);
+    }
     this.allAliases = new Map();
     const contexts: pc.DocContext[] = [];
 
@@ -233,6 +331,170 @@ export class FSHImporter extends FSHVisitor {
     logger.info(`Imported ${definitions} definitions and ${instances} instances.`);
 
     return this.docs;
+  }
+
+  /**
+   * Imports like import, but reuses what was imported from each unchanged file, as long as
+   * everything that file's import used from other files is also unchanged. The documents and the
+   * log messages are the same as import's.
+   */
+  private importWithCache(rawFSHes: RawFSH[], cache: ImportCache): FSHDocument[] {
+    const aliases = new ObservedMap<string>();
+    const paramRuleSets = new ObservedMap<ParamRuleSet>();
+    this.allAliases = aliases;
+    this.paramRuleSets = paramRuleSets;
+    aliases.onHas = (key, result) => this.dependencies?.note(['aliasHas', key, result]);
+    aliases.onGet = (key, result) => this.dependencies?.note(['aliasGet', key, result ?? null]);
+    paramRuleSets.onGet = (key, result) => this.dependencies?.noteRuleSet(key, result);
+    const files: {
+      rawFSH: RawFSH;
+      content: string;
+      cached: CachedImport | null;
+      ctx: pc.DocContext | null;
+      parseLogs: any[] | null;
+      items: PreprocessedItem[];
+    }[] = [];
+
+    rawFSHes.forEach(rawFSH => {
+      const doc = new FSHDocument(rawFSH.path);
+      this.docs.push(doc);
+      this.currentDoc = doc;
+      this.currentFile = this.currentDoc.file ?? '';
+      // See import for why the newline is added
+      const content = rawFSH.content.endsWith('\n') ? rawFSH.content : rawFSH.content + '\n';
+      const cached = cache.lookup(rawFSH.path, content);
+      let ctx: pc.DocContext = null;
+      let parseLogs: any[] = null;
+      let items: PreprocessedItem[];
+      if (cached != null) {
+        cache.emit(cached.parseLogs);
+        parseLogs = cached.parseLogs;
+        items = cached.items;
+      } else {
+        const parsed = cache.capture(() => this.parseDoc(content, rawFSH.path), false);
+        ctx = parsed.result;
+        parseLogs = parsed.logs;
+        items = this.extractPreprocessedItems(ctx);
+      }
+      this.applyPreprocessedItems(doc, items);
+      files.push({ rawFSH, content, cached, ctx, parseLogs, items });
+      this.currentDoc = null;
+      this.currentFile = null;
+    });
+    logger.info(`Preprocessed ${this.docs.length} documents with ${this.allAliases.size} aliases.`);
+
+    files.forEach((file, index) => {
+      const liveDoc = this.docs[index];
+      if (file.cached != null && this.dependenciesHold(file.cached.dependencies, liveDoc, cache)) {
+        const doc = cache.decodeDoc(file.cached.doc);
+        if (doc != null) {
+          // aliases are collected during preprocessing, which already ran for this build
+          doc.aliases.clear();
+          liveDoc.aliases.forEach((value, name) => doc.aliases.set(name, value));
+          this.docs[index] = doc;
+          cache.emit(file.cached.visitLogs);
+          cache.keep(file.rawFSH.path);
+          return;
+        }
+      }
+      let ctx = file.ctx;
+      if (ctx == null) {
+        // its parse messages were already written, during preprocessing
+        ctx = cache.capture(() => this.parseDoc(file.content, file.rawFSH.path), true).result;
+      }
+      this.currentDoc = liveDoc;
+      this.currentFile = this.currentDoc.file ?? '';
+      this.visitingDoc = liveDoc;
+      const dependencies = new DependencyRecorder(
+        value => cache.hash(value),
+        (during, e) => cache.failed(`${during} for ${file.rawFSH.path}`, e, true)
+      );
+      this.dependencies = dependencies;
+      let visited: { logs: any[] | null };
+      this.caughtRangeError = false;
+      try {
+        visited = cache.capture(() => this.visitDoc(ctx), false);
+      } finally {
+        this.dependencies = null;
+        this.visitingDoc = null;
+        this.currentDoc = null;
+        this.currentFile = null;
+      }
+      if (file.parseLogs == null || visited.logs == null) {
+        cache.skipped(file.rawFSH.path, 'a message it logs could not be copied');
+      } else if (this.caughtRangeError) {
+        // e.g. running out of stack space, where what is logged depends on how deep the stack was
+        cache.skipped(file.rawFSH.path, 'importing it caught a RangeError');
+      } else if (!dependencies.failed) {
+        let encoded: any = null;
+        try {
+          encoded = cache.encodeDoc(liveDoc);
+        } catch (e) {
+          encoded = null;
+          cache.failed(`encoding the import of ${file.rawFSH.path}`, e, true);
+        }
+        if (encoded != null) {
+          cache.store(file.rawFSH.path, file.content, {
+            parseLogs: file.parseLogs,
+            items: file.items,
+            dependencies: dependencies.list,
+            visitLogs: visited.logs,
+            doc: encoded
+          });
+        }
+      }
+    });
+
+    let [definitions, instances] = [0, 0];
+    this.docs.forEach(doc => {
+      definitions +=
+        doc.codeSystems.size +
+        doc.extensions.size +
+        doc.profiles.size +
+        doc.valueSets.size +
+        doc.logicals.size +
+        doc.resources.size;
+      instances += doc.instances.size;
+    });
+    logger.info(`Imported ${definitions} definitions and ${instances} instances.`);
+
+    return this.docs;
+  }
+
+  /** Whether everything a document's import used from outside it is the same as it was then. */
+  private dependenciesHold(
+    dependencies: ImportDependency[],
+    doc: FSHDocument,
+    cache: ImportCache
+  ): boolean {
+    try {
+      return dependencies.every(dependency => {
+        switch (dependency[0]) {
+          case 'aliasHas':
+            return Map.prototype.has.call(this.allAliases, dependency[1]) === dependency[2];
+          case 'aliasGet':
+            return (
+              (Map.prototype.get.call(this.allAliases, dependency[1]) ?? null) === dependency[2]
+            );
+          case 'ruleSet':
+            return (
+              cache.hash(Map.prototype.get.call(this.paramRuleSets, dependency[1]) ?? null) ===
+              dependency[2]
+            );
+          case 'duplicate':
+            return (
+              this.docs.some(
+                d => d !== doc && (d[dependency[1]] as Map<string, any>)?.has(dependency[2])
+              ) === dependency[3]
+            );
+          default:
+            return false;
+        }
+      });
+    } catch (e) {
+      cache.failed(`checking what the cached import of ${doc.file} used`, e);
+      return false;
+    }
   }
 
   /**
@@ -306,6 +568,12 @@ export class FSHImporter extends FSHVisitor {
   }
 
   private isDuplicate(collection: DocumentCollection, name: string): boolean {
+    if (this.dependencies != null) {
+      const elsewhere = this.docs.some(
+        doc => doc !== this.visitingDoc && (doc[collection] as Map<string, any>).has(name)
+      );
+      this.dependencies.note(['duplicate', collection, name, elsewhere]);
+    }
     return this.docs.some(doc => (doc[collection] as Map<string, any>).has(name));
   }
 
@@ -314,6 +582,9 @@ export class FSHImporter extends FSHVisitor {
       try {
         this.visitEntity(e);
       } catch (err) {
+        if (err instanceof RangeError) {
+          this.caughtRangeError = true;
+        }
         const sourceInfo = { location: this.extractStartStop(e), file: this.currentFile };
         logger.error(`Error in parsing: ${err.message}`, sourceInfo);
         if (err.stack) {
