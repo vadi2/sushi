@@ -7,6 +7,9 @@ import { StructureDefinition, InstanceDefinition, ValueSet, CodeSystem } from '.
 import { Configuration, SourceInfo } from '../fshtypes';
 import { Fishable, Type, Metadata } from '../utils/Fishable';
 
+type PackageDefinition = StructureDefinition | ValueSet | CodeSystem | InstanceDefinition;
+type FishCandidates = [PackageDefinition[], (def: PackageDefinition) => boolean][];
+
 export class Package implements Fishable {
   public readonly profiles: StructureDefinition[] = [];
   public readonly extensions: StructureDefinition[] = [];
@@ -41,7 +44,28 @@ export class Package implements Fishable {
     stopOnFirstMatch: boolean
   ): (StructureDefinition | ValueSet | CodeSystem | InstanceDefinition)[] {
     const results: (StructureDefinition | ValueSet | CodeSystem | InstanceDefinition)[] = [];
+    for (const candidates of this.getCandidates(item, types)) {
+      let def: PackageDefinition;
+      for (const [list, matches] of candidates) {
+        def = list.find(matches);
+        if (def) {
+          break;
+        }
+      }
+      if (def) {
+        if (stopOnFirstMatch) {
+          return [def];
+        }
+        results.push(def);
+      }
+    }
+    return results;
+  }
 
+  /**
+   * For each type to fish for, the lists to search (in order) and how to recognize a match in each
+   */
+  private getCandidates(item: string, types: Type[]): FishCandidates[] {
     // No types passed in means to search ALL supported types
     if (types.length === 0) {
       types = [
@@ -59,132 +83,142 @@ export class Package implements Fishable {
     const [base, ...versionParts] = item?.split('|') ?? ['', ''];
     const version = versionParts.join('|') || null;
 
-    for (const type of types) {
-      let def;
+    return types.map(type => {
+      let candidates: FishCandidates;
       switch (type) {
         case Type.Profile:
-          def = this.profiles.find(
-            p =>
-              (p.id === base || p.name === base || p.url === base) &&
-              (version == null || p.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.profiles,
+              (p: StructureDefinition) =>
+                (p.id === base || p.name === base || p.url === base) &&
+                (version == null || p.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'StructureDefinition' &&
                 i.derivation === 'constraint' &&
                 i.type !== 'Extension' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.Extension:
-          def = this.extensions.find(
-            e =>
-              (e.id === base || e.name === base || e.url === base) &&
-              (version == null || e.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.extensions,
+              (e: StructureDefinition) =>
+                (e.id === base || e.name === base || e.url === base) &&
+                (version == null || e.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'StructureDefinition' &&
                 i.derivation === 'constraint' &&
                 i.type === 'Extension' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.Logical:
-          def = this.logicals.find(
-            l =>
-              (l.id === base || l.name === base || l.url === base) &&
-              (version == null || l.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.logicals,
+              (l: StructureDefinition) =>
+                (l.id === base || l.name === base || l.url === base) &&
+                (version == null || l.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'StructureDefinition' &&
                 i.derivation === 'specialization' &&
                 i.kind === 'logical' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.Resource:
-          def = this.resources.find(
-            r =>
-              (r.id === base || r.name === base || r.url === base) &&
-              (version == null || r.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.resources,
+              (r: StructureDefinition) =>
+                (r.id === base || r.name === base || r.url === base) &&
+                (version == null || r.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'StructureDefinition' &&
                 i.derivation === 'specialization' &&
                 i.kind === 'resource' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.ValueSet:
-          def = this.valueSets.find(
-            vs =>
-              (vs.id === base || vs.name === base || vs.url === base) &&
-              (version == null || vs.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.valueSets,
+              (vs: ValueSet) =>
+                (vs.id === base || vs.name === base || vs.url === base) &&
+                (version == null || vs.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'ValueSet' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.CodeSystem:
-          def = this.codeSystems.find(
-            cs =>
-              (cs.id === base || cs.name === base || cs.url === base) &&
-              (version == null || cs.version === version)
-          );
-          if (!def) {
-            def = this.instances.find(
-              i =>
+          candidates = [
+            [
+              this.codeSystems,
+              (cs: CodeSystem) =>
+                (cs.id === base || cs.name === base || cs.url === base) &&
+                (version == null || cs.version === version)
+            ],
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
                 i._instanceMeta.usage === 'Definition' &&
                 i.resourceType === 'CodeSystem' &&
                 (i.id === base || i._instanceMeta.name === base || i.url === base) &&
                 (version == null || i.version === version)
-            );
-          }
+            ]
+          ];
           break;
         case Type.Instance:
-          def = this.instances.find(
-            i =>
-              (i.id === base || i._instanceMeta.name === base) &&
-              (version == null || i.version === version)
-          );
+          candidates = [
+            [
+              this.instances,
+              (i: InstanceDefinition) =>
+                (i.id === base || i._instanceMeta.name === base) &&
+                (version == null || i.version === version)
+            ]
+          ];
           break;
         case Type.Type: // Package doesn't currently support types
         default:
+          candidates = [];
           break;
       }
-      if (def) {
-        if (stopOnFirstMatch) {
-          return [def];
-        }
-        results.push(def);
-      }
-    }
-    return results;
+      return candidates;
+    });
   }
 
   fishForFHIR(item: string, ...types: Type[]): any | undefined {

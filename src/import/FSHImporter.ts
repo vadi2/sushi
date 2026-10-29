@@ -138,6 +138,27 @@ function unescapeUnicode(match: string, p1: string): string {
   return JSON.parse(`"\\${p1}"`);
 }
 
+type PreprocessedAlias = { alias: string; value: string; location: TextLocation };
+type PreprocessedRuleSet = {
+  ruleSet: string;
+  params: string[];
+  contents: string;
+  location: TextLocation;
+};
+type PreprocessedItem = PreprocessedAlias | PreprocessedRuleSet;
+
+type DocumentCollection =
+  | 'profiles'
+  | 'extensions'
+  | 'resources'
+  | 'logicals'
+  | 'instances'
+  | 'valueSets'
+  | 'codeSystems'
+  | 'invariants'
+  | 'ruleSets'
+  | 'mappings';
+
 /**
  * FSHImporter handles the parsing of FSH documents, constructing the data into FSH types.
  * FSHImporter uses a visitor pattern approach with some accomodations due to the ANTLR4
@@ -183,44 +204,7 @@ export class FSHImporter extends FSHVisitor {
       contexts.push(ctx);
 
       // Collect the aliases and store in global map
-      ctx.entity().forEach(e => {
-        if (e.alias()) {
-          const name = e.alias().name().getText();
-          let value = e.alias().SEQUENCE()?.getText();
-          // When the url contains a fragment (http://example.org#fragment), the grammar will read it as a
-          // CODE, so we also accept that for the value here
-          if (!value && e.alias().CODE()) {
-            value = e.alias().CODE().getText();
-          }
-          if (name.includes('|')) {
-            logger.error(
-              `Alias ${name} cannot include "|" since the "|" character is reserved for indicating a version`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-            return;
-          } else if (!aliasRegex.test(name)) {
-            logger.warn(
-              `Alias ${name} includes unsupported characters. Alias names can only contain letters, numbers, underscores ("_"), hyphens ("-"), and dots (".").`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-          }
-          if (this.allAliases.has(name) && this.allAliases.get(name) !== value) {
-            logger.error(
-              `Alias ${name} cannot be redefined to ${value}; it is already defined as ${this.allAliases.get(
-                name
-              )}.`,
-              { file: doc.file ?? '', location: this.extractStartStop(e.alias()) }
-            );
-            // don't set it -- just keep the original definition
-          } else {
-            this.allAliases.set(name, value);
-            doc.aliases.set(name, value);
-          }
-        }
-        if (e.paramRuleSet()) {
-          this.visitParamRuleSet(e.paramRuleSet());
-        }
-      });
+      this.applyPreprocessedItems(doc, this.extractPreprocessedItems(ctx));
       this.currentDoc = null;
       this.currentFile = null;
     });
@@ -249,6 +233,80 @@ export class FSHImporter extends FSHVisitor {
     logger.info(`Imported ${definitions} definitions and ${instances} instances.`);
 
     return this.docs;
+  }
+
+  /**
+   * Finds the aliases and parameterized RuleSets in a parsed document. These are collected from
+   * every document before any document is visited, since any document may use them.
+   */
+  private extractPreprocessedItems(ctx: pc.DocContext): PreprocessedItem[] {
+    const items: PreprocessedItem[] = [];
+    ctx.entity().forEach(e => {
+      if (e.alias()) {
+        const name = e.alias().name().getText();
+        let value = e.alias().SEQUENCE()?.getText();
+        // When the url contains a fragment (http://example.org#fragment), the grammar will read it as a
+        // CODE, so we also accept that for the value here
+        if (!value && e.alias().CODE()) {
+          value = e.alias().CODE().getText();
+        }
+        items.push({ alias: name, value, location: this.extractStartStop(e.alias()) });
+      }
+      if (e.paramRuleSet()) {
+        const ruleSetCtx = e.paramRuleSet();
+        const { name, params } = this.parseRuleSetReference(ruleSetCtx.paramRuleSetRef());
+        items.push({
+          ruleSet: name,
+          params,
+          contents: this.visitParamRuleSetContent(ruleSetCtx.paramRuleSetContent()),
+          location: this.extractStartStop(ruleSetCtx)
+        });
+      }
+    });
+    return items;
+  }
+
+  private applyPreprocessedItems(doc: FSHDocument, items: PreprocessedItem[]): void {
+    items.forEach(item => {
+      if ('alias' in item) {
+        this.applyAlias(doc, item);
+      } else {
+        this.applyParamRuleSet(item);
+      }
+    });
+  }
+
+  private applyAlias(doc: FSHDocument, item: PreprocessedAlias): void {
+    const name = item.alias;
+    const value = item.value;
+    if (name.includes('|')) {
+      logger.error(
+        `Alias ${name} cannot include "|" since the "|" character is reserved for indicating a version`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+      return;
+    } else if (!aliasRegex.test(name)) {
+      logger.warn(
+        `Alias ${name} includes unsupported characters. Alias names can only contain letters, numbers, underscores ("_"), hyphens ("-"), and dots (".").`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+    }
+    if (this.allAliases.has(name) && this.allAliases.get(name) !== value) {
+      logger.error(
+        `Alias ${name} cannot be redefined to ${value}; it is already defined as ${this.allAliases.get(
+          name
+        )}.`,
+        { file: doc.file ?? '', location: { ...item.location } }
+      );
+      // don't set it -- just keep the original definition
+    } else {
+      this.allAliases.set(name, value);
+      doc.aliases.set(name, value);
+    }
+  }
+
+  private isDuplicate(collection: DocumentCollection, name: string): boolean {
+    return this.docs.some(doc => (doc[collection] as Map<string, any>).has(name));
   }
 
   visitDoc(ctx: pc.DocContext): void {
@@ -296,7 +354,7 @@ export class FSHImporter extends FSHVisitor {
     const profile = new Profile(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.profiles.has(profile.name))) {
+    if (this.isDuplicate('profiles', profile.name)) {
       logger.error(`Skipping Profile: a Profile named ${profile.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -311,7 +369,7 @@ export class FSHImporter extends FSHVisitor {
     const extension = new Extension(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.extensions.has(extension.name))) {
+    if (this.isDuplicate('extensions', extension.name)) {
       logger.error(`Skipping Extension: an Extension named ${extension.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -370,7 +428,7 @@ export class FSHImporter extends FSHVisitor {
     const resource = new Resource(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.resources.has(resource.name))) {
+    if (this.isDuplicate('resources', resource.name)) {
       logger.error(`Skipping Resource: a Resource named ${resource.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -385,7 +443,7 @@ export class FSHImporter extends FSHVisitor {
     const logical = new Logical(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.logicals.has(logical.name))) {
+    if (this.isDuplicate('logicals', logical.name)) {
       logger.error(
         `Skipping Logical Model: a Logical Model named ${logical.name} already exists.`,
         {
@@ -448,7 +506,7 @@ export class FSHImporter extends FSHVisitor {
     const instance = new Instance(ctx.name().getText())
       .withLocation(location)
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.instances.has(instance.name))) {
+    if (this.isDuplicate('instances', instance.name)) {
       logger.error(`Skipping Instance: an Instance named ${instance.name} already exists.`, {
         file: this.currentFile,
         location
@@ -526,7 +584,7 @@ export class FSHImporter extends FSHVisitor {
     const valueSet = new FshValueSet(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.valueSets.has(valueSet.name))) {
+    if (this.isDuplicate('valueSets', valueSet.name)) {
       logger.error(`Skipping ValueSet: a ValueSet named ${valueSet.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -595,7 +653,7 @@ export class FSHImporter extends FSHVisitor {
     const codeSystem = new FshCodeSystem(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.codeSystems.has(codeSystem.name))) {
+    if (this.isDuplicate('codeSystems', codeSystem.name)) {
       logger.error(`Skipping code system: a code system named ${codeSystem.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -646,7 +704,7 @@ export class FSHImporter extends FSHVisitor {
     const invariant = new Invariant(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.invariants.has(invariant.name))) {
+    if (this.isDuplicate('invariants', invariant.name)) {
       logger.error(`Skipping Invariant: an Invariant named ${invariant.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -701,7 +759,7 @@ export class FSHImporter extends FSHVisitor {
     const ruleSet = new RuleSet(ctx.RULESET_REFERENCE().getText().trim())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.ruleSets.has(ruleSet.name))) {
+    if (this.isDuplicate('ruleSets', ruleSet.name)) {
       logger.error(`Skipping RuleSet: a RuleSet named ${ruleSet.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
@@ -732,19 +790,18 @@ export class FSHImporter extends FSHVisitor {
     });
   }
 
-  visitParamRuleSet(ctx: pc.ParamRuleSetContext): void {
-    const { name, params } = this.parseRuleSetReference(ctx.paramRuleSetRef());
-    const paramRuleSet = new ParamRuleSet(name)
-      .withLocation(this.extractStartStop(ctx))
+  private applyParamRuleSet(item: PreprocessedRuleSet): void {
+    const paramRuleSet = new ParamRuleSet(item.ruleSet)
+      .withLocation({ ...item.location })
       .withFile(this.currentFile);
     if (this.paramRuleSets.has(paramRuleSet.name)) {
       logger.error(`Skipping RuleSet: a RuleSet named ${paramRuleSet.name} already exists.`, {
         file: this.currentFile,
-        location: this.extractStartStop(ctx)
+        location: { ...item.location }
       });
     } else {
-      paramRuleSet.parameters = params;
-      paramRuleSet.contents = this.visitParamRuleSetContent(ctx.paramRuleSetContent());
+      paramRuleSet.parameters = item.params;
+      paramRuleSet.contents = item.contents;
       const unusedParameters = paramRuleSet.getUnusedParameters();
       if (unusedParameters.length > 0) {
         logger.warn(
@@ -766,7 +823,7 @@ export class FSHImporter extends FSHVisitor {
     const mapping = new Mapping(ctx.name().getText())
       .withLocation(this.extractStartStop(ctx))
       .withFile(this.currentFile);
-    if (this.docs.some(doc => doc.mappings.has(mapping.name))) {
+    if (this.isDuplicate('mappings', mapping.name)) {
       logger.error(`Skipping Mapping: a Mapping named ${mapping.name} already exists.`, {
         file: this.currentFile,
         location: this.extractStartStop(ctx)
